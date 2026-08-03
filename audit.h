@@ -3,6 +3,8 @@
 
 #include <stdint.h>
 
+#include "protocol.h"
+
 typedef struct {
     uint64_t user_id;
     const char *plaintext_sha256;

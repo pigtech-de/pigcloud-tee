@@ -10,24 +10,6 @@
 #include "sanitizers.h"
 #include "memfd_helpers.h"
 
-static const char *FFMPEG_CANDIDATES[] = {
-    "/usr/local/lib/pigcloud-tee/ffmpeg",
-    "/usr/bin/ffmpeg",
-    "/usr/local/bin/ffmpeg",
-    "ffmpeg",
-    NULL
-};
-
-static const char *find_ffmpeg(void)
-{
-    for (int i = 0; FFMPEG_CANDIDATES[i]; i++) {
-        if (access(FFMPEG_CANDIDATES[i], X_OK) == 0) {
-            return FFMPEG_CANDIDATES[i];
-        }
-    }
-    return NULL;
-}
-
 static const char *ffmpeg_format(const char *ext)
 {
     if (!ext || ext[0] == '\0') return "mp4";
@@ -49,32 +31,6 @@ static const char *ffmpeg_format(const char *ext)
     return "mp4";
 }
 
-static int run_ffmpeg(const char *ffmpeg, char *const argv[], int timeout_secs,
-                      const int *keep_fds, size_t n_keep)
-{
-    if (timeout_secs <= 0) return TEE_SUBPROC_TIMEOUT;
-    pid_t pid = fork();
-    if (pid < 0) return TEE_SUBPROC_FAIL;
-
-    if (pid == 0) {
-        int devnull = open("/dev/null", O_WRONLY | O_CLOEXEC);
-        if (devnull >= 0) {
-            dup2(devnull, STDOUT_FILENO);
-            dup2(devnull, STDERR_FILENO);
-            if (devnull > STDERR_FILENO) close(devnull);
-        }
-        for (size_t i = 0; i < n_keep; i++) {
-            tee_keep_after_exec(keep_fds[i]);
-        }
-        tee_harden_child((rlim_t)timeout_secs * 4 + 30);
-        execv(ffmpeg, argv);
-        _exit(127);
-    }
-
-    int status = 0;
-    return tee_wait_child(pid, timeout_secs, &status);
-}
-
 int sanitize_video(
     const unsigned char *data, size_t len,
     const char *ext,
@@ -89,7 +45,7 @@ int sanitize_video(
         return SANITIZE_REJECTED;
     }
 
-    const char *ffmpeg = find_ffmpeg();
+    const char *ffmpeg = tee_find_binary(TEE_FFMPEG_CANDIDATES);
     if (!ffmpeg) {
         snprintf(reason, reason_size, "ffmpeg_not_installed");
         return SANITIZE_ERROR;
@@ -97,27 +53,17 @@ int sanitize_video(
 
     const char *fmt = ffmpeg_format(ext);
 
-    char in_path[64], out_path[64];
-
-    int in_fd = tee_memfd_create("tee_vid_in", in_path, sizeof(in_path));
-    if (in_fd < 0) {
-        snprintf(reason, reason_size, "memfd_create_failed");
+    tee_memfd_pair_t io;
+    const char *memfd_reason = NULL;
+    if (tee_memfd_pair_open(&io, "tee_vid_in", "tee_vid_out",
+                            data, len, &memfd_reason) != 0) {
+        snprintf(reason, reason_size, "%s", memfd_reason);
         return SANITIZE_ERROR;
     }
-
-    int out_fd = tee_memfd_create("tee_vid_out", out_path, sizeof(out_path));
-    if (out_fd < 0) {
-        close(in_fd);
-        snprintf(reason, reason_size, "memfd_create_failed");
-        return SANITIZE_ERROR;
-    }
-
-    if (tee_memfd_write(in_fd, data, len) != 0) {
-        close(in_fd);
-        close(out_fd);
-        snprintf(reason, reason_size, "memfd_write_failed");
-        return SANITIZE_ERROR;
-    }
+    int in_fd = io.in_fd;
+    int out_fd = io.out_fd;
+    char *in_path = io.in_path;
+    char *out_path = io.out_path;
 
     struct timespec scan_deadline;
     clock_gettime(CLOCK_MONOTONIC, &scan_deadline);
@@ -134,12 +80,12 @@ int sanitize_video(
 
     int remux_to = tee_secs_until(&scan_deadline);
     if (remux_to > TEE_SUBPROC_WALL_CAP_SECS) remux_to = TEE_SUBPROC_WALL_CAP_SECS;
-    int rc = run_ffmpeg(ffmpeg, remux_args, remux_to, (const int[]){in_fd, out_fd}, 2);
+    int rc = tee_spawn_converter(ffmpeg, remux_args, remux_to, (const int[]){in_fd, out_fd}, 2);
 
     if (rc != 0) {
         close(out_fd);
 
-        char renc_path[64];
+        char renc_path[TEE_MEMFD_PATH_MAX];
         int renc_fd = tee_memfd_create("tee_vid_renc", renc_path, sizeof(renc_path));
         if (renc_fd < 0) {
             close(in_fd);
@@ -161,7 +107,7 @@ int sanitize_video(
         int reencode_to = tee_secs_until(&scan_deadline);
         if (reencode_to > TEE_SUBPROC_WALL_CAP_SECS) reencode_to = TEE_SUBPROC_WALL_CAP_SECS;
 
-        rc = run_ffmpeg(ffmpeg, reencode_args, reencode_to, (const int[]){in_fd, renc_fd}, 2);
+        rc = tee_spawn_converter(ffmpeg, reencode_args, reencode_to, (const int[]){in_fd, renc_fd}, 2);
 
         if (rc != 0) {
             close(in_fd);

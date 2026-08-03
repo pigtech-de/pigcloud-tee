@@ -1,6 +1,7 @@
 #ifndef PIGCLOUD_TEE_PROTOCOL_H
 #define PIGCLOUD_TEE_PROTOCOL_H
 
+#include <stddef.h>
 #include <stdint.h>
 
 #define PROTOCOL_MAX_MSG_SIZE (16 * 1024 * 1024)
@@ -42,6 +43,9 @@
 #define E2EE_LEN_PREFIX_SIZE  4
 #define E2EE_METADATA_VERSION 2
 
+#define SHA256_HEX_LEN 64
+#define SHA256_HEX_BUF (SHA256_HEX_LEN + 1)
+
 #define KYBER_PUBLIC_KEY_SIZE    1184
 #define KYBER_SEED_SIZE          64
 #define KYBER_SECRET_KEY_SIZE    2400
@@ -74,9 +78,9 @@ typedef struct {
     unsigned char meta_nonce[E2EE_NONCE_SIZE];
     int meta_chunk_size;
     int meta_chunks;
-    char meta_plaintext_sha256[65];
+    char meta_plaintext_sha256[SHA256_HEX_BUF];
     int64_t meta_plaintext_size;
-    char meta_metadata_mac[65];
+    char meta_metadata_mac[SHA256_HEX_BUF];
     char original_filename[256];
 } scan_request_t;
 
@@ -88,9 +92,9 @@ typedef struct {
     int has_new_meta;
     unsigned char new_nonce[E2EE_NONCE_SIZE];
     int new_chunks;
-    char new_plaintext_sha256[65];
+    char new_plaintext_sha256[SHA256_HEX_BUF];
     int64_t new_plaintext_size;
-    char new_metadata_mac[65];
+    char new_metadata_mac[SHA256_HEX_BUF];
     int has_tee_signature;
     unsigned char tee_signature_ed25519[E2EE_ED25519_SIG_SIZE];
     unsigned char tee_signature_mldsa[MLDSA44_SIGNATURE_SIZE];

@@ -210,7 +210,7 @@ int main(int argc, char **argv)
         }
         unsigned char enc_nonce[E2EE_NONCE_SIZE];
         int enc_chunks = 0;
-        char enc_sha[65];
+        char enc_sha[SHA256_HEX_BUF];
         tee_output_digest_t ct_digest = {0};
         int erc = tee_encrypt_file(sample, sizeof(sample), data_key, enc_path,
                                    enc_nonce, &enc_chunks, enc_sha, &ct_digest);

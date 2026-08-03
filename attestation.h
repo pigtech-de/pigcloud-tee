@@ -24,7 +24,7 @@ typedef struct {
     char *ias_report_b64;
     char *ias_signature_b64;
     char *ias_cert_chain;
-    char mrenclave_hex[65];
+    char mrenclave_hex[SHA256_HEX_BUF];
 } attestation_data_t;
 
 int attestation_init(void);
