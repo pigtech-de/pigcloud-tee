@@ -60,7 +60,7 @@ static int s_initialized = 0;
 static unsigned char *s_quote = NULL;
 static size_t s_quote_len = 0;
 static char *s_quote_b64 = NULL;
-static char s_mrenclave_hex[SHA256_HEX_BUF] = {0};
+static char s_mrenclave_hex[65] = {0};
 static time_t s_quote_generated_at = 0;
 
 static uint64_t s_epoch = 0;
@@ -377,7 +377,7 @@ static int generate_sgx_quote(void)
 
 static int generate_challenged_quote(const unsigned char nonce[TEE_ATTEST_NONCE_SIZE],
                                      char **quote_b64_out,
-                                     char mrenclave_hex_out[SHA256_HEX_BUF])
+                                     char mrenclave_hex_out[65])
 {
     unsigned char report_data[SGX_REPORT_DATA_SIZE];
     compute_hybrid_report_data(report_data, nonce);
@@ -647,7 +647,7 @@ int attestation_get_data(attestation_data_t *out, const unsigned char *nonce)
 
     if (s_mode == ATTEST_MODE_EPID) {
         char *challenged_b64 = NULL;
-        char challenged_mre[SHA256_HEX_BUF] = {0};
+        char challenged_mre[65] = {0};
         if (nonce != NULL
             && generate_challenged_quote(nonce, &challenged_b64, challenged_mre) == 0) {
             out->sgx_quote_b64 = challenged_b64;

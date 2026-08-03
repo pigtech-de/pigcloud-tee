@@ -1,32 +1,4 @@
 #!/usr/bin/env python3
-"""Generate scanner_whitelist.{h,c} from private/file-types.json.
-
-The TEE scanner's MIME + extension whitelist is derived from the shared file
-type registry. Regenerate whenever the registry changes — the Makefile wires
-this into the build so `make` handles it automatically.
-
-Emits a .h with extern declarations and a .c with the definitions, so both
-scanner.c and sanitizers/archive.c can include the header without producing
-duplicate static const arrays or "unused variable" warnings.
-
-Routing (driven by registry fields; see constants.md "File Type Registry"):
-
-    `scan: ["opaque"]`                -> OPAQUE_BINARY_EXTS (octet-stream
-                                         fallback admits the extension)
-    `scan: ["archive"]`               -> INSPECTABLE_ARCHIVE_EXTS (structural
-                                         inspection in sanitizers/archive.c)
-    `zipBased: true`                  -> entry's MIME also accepts a plain
-                                         application/zip detection
-    certificate, database, font types -> opaque, always
-    image/text/audio/video/font/model -> corresponding prefix bucket
-    anything with a concrete MIME     -> EXACT_MIMES entry
-
-What stays hardcoded here, deliberately: EXTRA_MIME_ALIASES encodes what the
-pinned libmagic snapshot actually reports for each format — a property of the
-scanner host, not of the format — and INSPECTABLE_ARCHIVE_MIMES encodes which
-detected MIMEs sanitizers/archive.c can parse. Per-extension routing lives in
-the registry so adding a format is a one-file change.
-"""
 
 from __future__ import annotations
 
@@ -130,7 +102,6 @@ def c_ext_list(exts: list[str]) -> str:
     return ", ".join(f'"{e}"' for e in exts)
 
 def build(registry_path: Path) -> dict:
-    """Parse the registry and compute all the lists the generator needs."""
     data = json.loads(registry_path.read_text(encoding="utf-8"))
     exts = data["extensions"]
 

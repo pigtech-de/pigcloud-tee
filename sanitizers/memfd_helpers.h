@@ -21,24 +21,6 @@
 #define TEE_SUBPROC_OK        0
 #define TEE_SUBPROC_FAIL     -1
 #define TEE_SUBPROC_TIMEOUT  -2
-#define TEE_SUBPROC_SPAWN_FAIL -3
-
-#define TEE_MEMFD_PATH_MAX   64
-
-static const char *const TEE_FFMPEG_CANDIDATES[] = {
-    "/usr/local/lib/pigcloud-tee/ffmpeg",
-    "/usr/bin/ffmpeg",
-    "/usr/local/bin/ffmpeg",
-    "ffmpeg",
-    NULL
-};
-
-static const char *const TEE_GS_CANDIDATES[] = {
-    "/usr/bin/gs",
-    "/usr/local/bin/gs",
-    "gs",
-    NULL
-};
 
 void tee_subproc_progress_tick(void);
 
@@ -148,89 +130,6 @@ static inline int tee_memfd_write(int fd, const unsigned char *data, size_t len)
         total += (size_t)wr;
     }
     return 0;
-}
-
-static inline const char *tee_find_binary(const char *const *candidates)
-{
-    for (int i = 0; candidates[i]; i++) {
-        if (access(candidates[i], X_OK) == 0) {
-            return candidates[i];
-        }
-    }
-    return NULL;
-}
-
-typedef struct {
-    int  in_fd;
-    int  out_fd;
-    char in_path[TEE_MEMFD_PATH_MAX];
-    char out_path[TEE_MEMFD_PATH_MAX];
-} tee_memfd_pair_t;
-
-static inline void tee_memfd_close(int *fd)
-{
-    if (*fd >= 0) {
-        close(*fd);
-        *fd = -1;
-    }
-}
-
-static inline int tee_memfd_pair_open(tee_memfd_pair_t *p,
-                                      const char *in_name, const char *out_name,
-                                      const unsigned char *data, size_t len,
-                                      const char **reason_out)
-{
-    p->in_fd = -1;
-    p->out_fd = -1;
-    p->in_path[0] = '\0';
-    p->out_path[0] = '\0';
-
-    p->in_fd = tee_memfd_create(in_name, p->in_path, sizeof(p->in_path));
-    if (p->in_fd < 0) {
-        *reason_out = "memfd_create_failed";
-        return -1;
-    }
-    p->out_fd = tee_memfd_create(out_name, p->out_path, sizeof(p->out_path));
-    if (p->out_fd < 0) {
-        tee_memfd_close(&p->in_fd);
-        *reason_out = "memfd_create_failed";
-        return -1;
-    }
-    if (tee_memfd_write(p->in_fd, data, len) != 0) {
-        tee_memfd_close(&p->in_fd);
-        tee_memfd_close(&p->out_fd);
-        *reason_out = "memfd_write_failed";
-        return -1;
-    }
-    return 0;
-}
-
-static inline int tee_spawn_converter(const char *bin, char *const argv[],
-                                      int timeout_secs,
-                                      const int *keep_fds, size_t n_keep)
-{
-    if (timeout_secs <= 0) return TEE_SUBPROC_TIMEOUT;
-
-    pid_t pid = fork();
-    if (pid < 0) return TEE_SUBPROC_SPAWN_FAIL;
-
-    if (pid == 0) {
-        int devnull = open("/dev/null", O_WRONLY | O_CLOEXEC);
-        if (devnull >= 0) {
-            dup2(devnull, STDOUT_FILENO);
-            dup2(devnull, STDERR_FILENO);
-            if (devnull > STDERR_FILENO) close(devnull);
-        }
-        for (size_t i = 0; i < n_keep; i++) {
-            tee_keep_after_exec(keep_fds[i]);
-        }
-        tee_harden_child((rlim_t)timeout_secs * 4 + 30);
-        execv(bin, argv);
-        _exit(127);
-    }
-
-    int status = 0;
-    return tee_wait_child(pid, timeout_secs, &status);
 }
 
 #endif

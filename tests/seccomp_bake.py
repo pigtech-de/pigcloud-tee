@@ -1,23 +1,4 @@
 #!/usr/bin/env python3
-"""Drive a representative corpus through the TEE scanner to bake the seccomp allowlist.
-
-TEE-CR-02 gates the enforce flip on a log-mode run showing zero denials. "Zero denials"
-is only evidence if scans actually ran: prod logged 3 scans in six days of log mode, and
-the 2121 scans before that predate the filter entirely, so the gate was never satisfiable
-by waiting. This pushes one file per sanitizer through the live scanner instead.
-
-Each sanitizer reaches different syscalls (the pdf and video paths fork converters), so a
-corpus that misses a format leaves that format's syscalls unexercised, and enforce mode
-would then KILL_PROCESS on the first real upload of it.
-
-Run on the server, as the uid the scanner expects as its peer:
-    sudo -u www-data python3 tee/tests/seccomp_bake.py
-    sudo journalctl -k --since "10 min ago" | grep type=1326
-
-Exits nonzero if any scan errored, so a broken corpus is not mistaken for a clean bake.
-
-Manual operator tool: no CI job or Makefile target runs it.
-"""
 import base64, hashlib, os, shutil, subprocess, sys, tempfile, zipfile
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -31,7 +12,6 @@ def _read(path):
         return f.read()
 
 def _run(cmd):
-    """Best-effort generator call. Returns None when the tool is absent."""
     try:
         subprocess.run(cmd, check=True, capture_output=True, timeout=60)
         return True
@@ -39,13 +19,6 @@ def _run(cmd):
         return None
 
 def build_corpus(workdir):
-    """One file per sanitizer path. ffmpeg/gs generate their own formats so the
-    bytes are real enough to reach the converters rather than bouncing off MIME.
-
-    Returns (corpus, missing). A format whose generator is absent is reported,
-    not silently dropped: its syscalls stay unexercised and enforce mode would
-    then kill the daemon on the first real upload of it.
-    """
     corpus = [("image/jpeg", "bake.jpg", create_test_jpeg())]
     missing = []
 

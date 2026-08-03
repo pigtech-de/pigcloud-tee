@@ -75,7 +75,7 @@ int tee_encrypt_file(
     const char *output_path,
     unsigned char new_nonce_out[E2EE_NONCE_SIZE],
     int *new_chunks_out,
-    char new_sha256_out[SHA256_HEX_BUF],
+    char new_sha256_out[65],
     tee_output_digest_t *ciphertext_digest_out
 );
 
@@ -98,7 +98,7 @@ int tee_compute_metadata_mac(
     int chunks,
     const char *plaintext_sha256,
     int64_t plaintext_size,
-    char mac_hex_out[SHA256_HEX_BUF]
+    char mac_hex_out[65]
 );
 
 #endif

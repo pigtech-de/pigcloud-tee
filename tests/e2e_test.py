@@ -1,16 +1,4 @@
 #!/usr/bin/env python3
-"""End-to-end test for PigCloud TEE Scanner.
-
-Requires: pynacl, liboqs-python (imports as `oqs`), cryptography.
-Install:  pip install pynacl liboqs-python cryptography
-          liboqs-python needs the liboqs C library (>= 0.13 for keypair_derand).
-
-Before touching the socket this runs self_check(): the seal, chunk framing, and
-metadata MAC are verified against tests/vectors/. Those are the same fixtures
-the Go/JS/PHP/C verifiers read, so a drifted harness fails here by name instead
-of arriving at the enclave as an opaque unseal_failed. `--self-check` runs only
-that half and never opens the socket.
-"""
 import socket, struct, json, os, hashlib, base64, sys, hmac
 from nacl.utils import random as nacl_random
 import nacl.bindings
@@ -34,7 +22,6 @@ VECTOR_DIR = os.environ.get("TEE_VECTOR_DIR", os.path.join(
     os.path.dirname(os.path.abspath(__file__)), "..", "..", "tests", "vectors"))
 
 def _recv_exact(sock, n):
-    """Stream sockets short-read, and a closed peer must raise rather than spin."""
     buf = b""
     while len(buf) < n:
         chunk = sock.recv(n - len(buf))
@@ -57,7 +44,6 @@ def ipc_request(msg_dict, timeout=None):
         sock.close()
 
 def increment_nonce(nonce_bytes):
-    """Little-endian increment (matches sodium_increment)."""
     arr = bytearray(nonce_bytes)
     for i in range(len(arr)):
         arr[i] = (arr[i] + 1) & 0xFF
@@ -66,7 +52,6 @@ def increment_nonce(nonce_bytes):
     return bytes(arr)
 
 def create_test_jpeg():
-    """Minimal valid JPEG."""
     return bytes([
         0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10, 0x4A, 0x46, 0x49, 0x46, 0x00, 0x01,
         0x01, 0x00, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0xFF, 0xDB, 0x00, 0x43,
@@ -119,11 +104,6 @@ def encrypt_e2ee(plaintext, data_key, nonce):
     return b"".join(chunks)
 
 def _hybrid_wrap_key(mlkem_ct, eph_pub, recipient_pk, ss_x, ss_k):
-    """v2 combiner: salt = mlkem_ct || eph_pk || recipient_static_pk, ikm = ssX || ssK.
-
-    Seal and unseal share this, so unsealing a vector blob produced by production
-    Go transitively proves the seal path's derivation too.
-    """
     return HKDF(
         algorithm=hashes.SHA256(),
         length=32,
@@ -132,7 +112,6 @@ def _hybrid_wrap_key(mlkem_ct, eph_pub, recipient_pk, ss_x, ss_k):
     ).derive(ss_x + ss_k)
 
 def hybrid_seal(plaintext, x25519_pk, kyber_pk):
-    """Match cli/internal/crypto/hybrid.go HybridSeal byte-for-byte."""
     eph_priv = nacl_random(32)
     eph_pub = nacl.bindings.crypto_scalarmult_base(eph_priv)
     ss_x = nacl.bindings.crypto_scalarmult(eph_priv, x25519_pk)
@@ -148,8 +127,6 @@ def hybrid_seal(plaintext, x25519_pk, kyber_pk):
     return eph_pub + ct_k + nonce + aead_ct
 
 def hybrid_unseal(sealed, x25519_sk, kyber_seed):
-    """Inverse of hybrid_seal. Only the vector self-check needs it: in production
-    the enclave owns the unseal side."""
     eph_pub = sealed[:EPH_PK_SIZE]
     ct_k = sealed[EPH_PK_SIZE:EPH_PK_SIZE + MLKEM_CT_SIZE]
     nonce = sealed[EPH_PK_SIZE + MLKEM_CT_SIZE:HYBRID_HEADER_SIZE]
@@ -168,7 +145,6 @@ def hybrid_unseal(sealed, x25519_sk, kyber_seed):
 
 def metadata_mac(data_key, nonce_b64, chunks, pt_sha, pt_size,
                  version=2, chunk_size=CHUNK_SIZE):
-    """Canonical form must match build_metadata_canonical() in tee/crypto.c."""
     canonical = json.dumps(
         [version, nonce_b64, chunk_size, chunks, pt_sha, pt_size],
         separators=(",", ":")
@@ -180,19 +156,12 @@ def _load_vector(name):
         return json.load(f)
 
 def _try_unseal(sealed, x25519_sk, kyber_seed):
-    """A diverged wrap key surfaces as an AEAD tag failure; name it instead of
-    letting the CryptoError traceback out."""
     try:
         return hybrid_unseal(sealed, x25519_sk, kyber_seed)
     except Exception:
         return None
 
 def self_check():
-    """Verify seal, chunk framing, and metadata MAC against the committed vectors.
-
-    Returns True when verified, False when the fixtures are not on disk (they
-    are dev-only, so a server-side run cannot assume them). Raises on drift.
-    """
     try:
         hv = _load_vector("hybrid_seal_v1.json")
         cv = _load_vector("chunked_file_v1.json")
@@ -254,16 +223,6 @@ def self_check():
 TEE_SIGNATURE_DOMAIN = b"pigcloud-tee-file-signature-v1"
 
 def verify_tee_signatures(result, attest, sanitized_path):
-    """Check the enclave signature pair over the sanitized ciphertext.
-
-    This is the live-ring pin on what the enclave signs. The daemon signs a
-    digest it computed while writing the file; if it ever signed something else
-    (a re-read of disk it did not produce, the plaintext hash) these signatures
-    stop matching sha256 of the bytes on disk and this fails. Strict-AND: both
-    algorithms must verify, matching the Go and JS verifiers.
-
-    Returns a list of problems; empty means verified.
-    """
     import nacl.signing
     import nacl.exceptions
 
@@ -310,8 +269,6 @@ def verify_tee_signatures(result, attest, sanitized_path):
     return bad
 
 def cleanup_scan_artifacts(test_file, quarantine):
-    """Sanitized output lands in the shared <quarantine>/sanitized/, not beside
-    the input (tee.md, sanitized-output path contract)."""
     paths = [test_file,
              os.path.join(quarantine, "sanitized",
                           os.path.basename(test_file) + ".sanitized")]

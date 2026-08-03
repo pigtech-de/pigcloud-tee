@@ -574,8 +574,7 @@ static int parse_scan_request(cJSON *json, scan_request_t *req)
     if (req->meta_chunks < expected_chunks - 1 || req->meta_chunks > expected_chunks + 1) {
         return -1;
     }
-    if (!is_hex_str(sha->valuestring, SHA256_HEX_LEN) ||
-        !is_hex_str(mac->valuestring, SHA256_HEX_LEN)) {
+    if (!is_hex_str(sha->valuestring, 64) || !is_hex_str(mac->valuestring, 64)) {
         return -1;
     }
 
@@ -588,10 +587,10 @@ static int parse_scan_request(cJSON *json, scan_request_t *req)
         return -1;
     }
 
-    memcpy(req->meta_plaintext_sha256, sha->valuestring, SHA256_HEX_LEN);
-    req->meta_plaintext_sha256[SHA256_HEX_LEN] = '\0';
-    memcpy(req->meta_metadata_mac, mac->valuestring, SHA256_HEX_LEN);
-    req->meta_metadata_mac[SHA256_HEX_LEN] = '\0';
+    memcpy(req->meta_plaintext_sha256, sha->valuestring, 64);
+    req->meta_plaintext_sha256[64] = '\0';
+    memcpy(req->meta_metadata_mac, mac->valuestring, 64);
+    req->meta_metadata_mac[64] = '\0';
 
     if (cJSON_IsString(filename)) {
         size_t fn_len = strlen(filename->valuestring);
@@ -634,28 +633,24 @@ static int handle_scan(int fd, cJSON *json)
     atomic_fetch_add(&g_inflight, 1);
 
     scan_request_t req;
-    unsigned char data_key[E2EE_KEY_SIZE];
-    unsigned char *plaintext = NULL;
-    size_t plaintext_len = 0;
-    unsigned char *sanitized = NULL;
-    size_t sanitized_len = 0;
-    long long reserve_bytes = 0;
-    int reserved = 0;
-    const char *fail_reason = NULL;
-
     if (parse_scan_request(json, &req) != 0) {
-        fail_reason = "invalid_request";
-        goto scan_failed;
+        audit_scan_failure(req.user_id, req.meta_plaintext_sha256,
+                           "invalid_request", scan_elapsed_ms(&ts_start));
+        atomic_fetch_sub(&g_inflight, 1);
+        return send_error(fd, "invalid_request");
     }
 
+    unsigned char data_key[E2EE_KEY_SIZE];
     char unseal_reason[96];
     if (scanner_unseal_via_signer(
             req.tee_sealed_key, req.tee_sealed_key_len, data_key,
             unseal_reason, sizeof(unseal_reason)) != 0) {
         fprintf(stderr, "WARN: scan unseal failed: %s (sealed_len=%zu)\n",
                 unseal_reason, req.tee_sealed_key_len);
-        fail_reason = "unseal_failed";
-        goto scan_failed;
+        audit_scan_failure(req.user_id, req.meta_plaintext_sha256,
+                           "unseal_failed", scan_elapsed_ms(&ts_start));
+        atomic_fetch_sub(&g_inflight, 1);
+        return send_error(fd, "unseal_failed");
     }
 
     {
@@ -668,21 +663,26 @@ static int handle_scan(int fd, cJSON *json)
                 req.meta_version, nonce_b64, req.meta_chunk_size,
                 req.meta_chunks, req.meta_plaintext_sha256,
                 req.meta_plaintext_size, req.meta_metadata_mac) != 0) {
-            fail_reason = "metadata_mac_invalid";
-            goto scan_failed;
+            sodium_memzero(data_key, sizeof(data_key));
+            audit_scan_failure(req.user_id, req.meta_plaintext_sha256,
+                               "metadata_mac_invalid", scan_elapsed_ms(&ts_start));
+            atomic_fetch_sub(&g_inflight, 1);
+            return send_error(fd, "metadata_mac_invalid");
         }
     }
 
-    reserve_bytes = (long long)req.meta_plaintext_size * TEE_SCAN_MEM_RESERVE_MULT;
+    long long reserve_bytes =
+        (long long)req.meta_plaintext_size * TEE_SCAN_MEM_RESERVE_MULT;
     if (tee_admission_reserve(&g_inflight_bytes, reserve_bytes) != 0) {
         atomic_fetch_add(&g_scans_busy, 1);
         sodium_memzero(data_key, sizeof(data_key));
         atomic_fetch_sub(&g_inflight, 1);
         return send_busy(fd);
     }
-    reserved = 1;
 
     clamav_stream_t *av_stream = clamav_stream_begin();
+    unsigned char *plaintext = NULL;
+    size_t plaintext_len = 0;
     int decrypt_rc = tee_decrypt_file_cb(
             req.file_path, data_key, req.meta_nonce,
             req.meta_chunks, req.meta_plaintext_sha256,
@@ -695,8 +695,12 @@ static int handle_scan(int fd, cJSON *json)
             char av_sig[1] = {0};
             clamav_stream_finish(av_stream, av_sig, sizeof av_sig);
         }
-        fail_reason = "decryption_failed";
-        goto scan_failed;
+        sodium_memzero(data_key, sizeof(data_key));
+        tee_admission_release(&g_inflight_bytes, reserve_bytes);
+        audit_scan_failure(req.user_id, req.meta_plaintext_sha256,
+                           "decryption_failed", scan_elapsed_ms(&ts_start));
+        atomic_fetch_sub(&g_inflight, 1);
+        return send_error(fd, "decryption_failed");
     }
 
     char av_sig[128] = {0};
@@ -709,11 +713,19 @@ static int handle_scan(int fd, cJSON *json)
 
     if (av_verdict != CLAMAV_VERDICT_INFECTED &&
         tee_scan_past_deadline(NULL, scan_elapsed_ms(&ts_start))) {
-        fail_reason = "scan_deadline_exceeded";
-        goto scan_failed;
+        sodium_memzero(plaintext, plaintext_len);
+        free(plaintext);
+        sodium_memzero(data_key, sizeof(data_key));
+        tee_admission_release(&g_inflight_bytes, reserve_bytes);
+        audit_scan_failure(req.user_id, req.meta_plaintext_sha256,
+                           "scan_deadline_exceeded", scan_elapsed_ms(&ts_start));
+        atomic_fetch_sub(&g_inflight, 1);
+        return send_error(fd, "scan_deadline_exceeded");
     }
 
     scan_result_t result;
+    unsigned char *sanitized = NULL;
+    size_t sanitized_len = 0;
 
     if (av_verdict == CLAMAV_VERDICT_INFECTED) {
         memset(&result, 0, sizeof(result));
@@ -724,13 +736,29 @@ static int handle_scan(int fd, cJSON *json)
     } else if (scanner_inspect(plaintext, plaintext_len, req.original_filename,
                                skip_av_in_scanner,
                                &result, &sanitized, &sanitized_len) != 0) {
-        fail_reason = "scanner_internal_error";
-        goto scan_failed;
+        sodium_memzero(plaintext, plaintext_len);
+        free(plaintext);
+        sodium_memzero(data_key, sizeof(data_key));
+        tee_admission_release(&g_inflight_bytes, reserve_bytes);
+        audit_scan_failure(req.user_id, req.meta_plaintext_sha256,
+                           "scanner_internal_error", scan_elapsed_ms(&ts_start));
+        atomic_fetch_sub(&g_inflight, 1);
+        return send_error(fd, "scanner_internal_error");
     }
 
     if (tee_scan_past_deadline(result.verdict, scan_elapsed_ms(&ts_start))) {
-        fail_reason = "scan_deadline_exceeded";
-        goto scan_failed;
+        if (sanitized) {
+            sodium_memzero(sanitized, sanitized_len);
+            free(sanitized);
+        }
+        sodium_memzero(plaintext, plaintext_len);
+        free(plaintext);
+        sodium_memzero(data_key, sizeof(data_key));
+        tee_admission_release(&g_inflight_bytes, reserve_bytes);
+        audit_scan_failure(req.user_id, req.meta_plaintext_sha256,
+                           "scan_deadline_exceeded", scan_elapsed_ms(&ts_start));
+        atomic_fetch_sub(&g_inflight, 1);
+        return send_error(fd, "scan_deadline_exceeded");
     }
 
     if (sanitized && sanitized_len > 0) {
@@ -743,20 +771,36 @@ static int handle_scan(int fd, cJSON *json)
                          QUARANTINE_SANITIZED_SUBDIR,
                          basename);
         if (n < 0 || (size_t)n >= sizeof(sanitized_path)) {
-            fail_reason = "sanitized_path_too_long";
-            goto scan_failed;
+            sodium_memzero(sanitized, sanitized_len);
+            free(sanitized);
+            sodium_memzero(plaintext, plaintext_len);
+            free(plaintext);
+            sodium_memzero(data_key, sizeof(data_key));
+            tee_admission_release(&g_inflight_bytes, reserve_bytes);
+            audit_scan_failure(req.user_id, req.meta_plaintext_sha256,
+                               "sanitized_path_too_long", scan_elapsed_ms(&ts_start));
+            atomic_fetch_sub(&g_inflight, 1);
+            return send_error(fd, "sanitized_path_too_long");
         }
 
         unsigned char new_nonce[E2EE_NONCE_SIZE];
         int new_chunks = 0;
-        char new_sha256[SHA256_HEX_BUF];
+        char new_sha256[65];
         tee_output_digest_t ct_digest = {0};
 
         if (tee_encrypt_file(sanitized, sanitized_len, data_key,
                              sanitized_path, new_nonce, &new_chunks, new_sha256,
                              &ct_digest) != 0) {
-            fail_reason = "reencryption_failed";
-            goto scan_failed;
+            sodium_memzero(sanitized, sanitized_len);
+            free(sanitized);
+            sodium_memzero(plaintext, plaintext_len);
+            free(plaintext);
+            sodium_memzero(data_key, sizeof(data_key));
+            tee_admission_release(&g_inflight_bytes, reserve_bytes);
+            audit_scan_failure(req.user_id, req.meta_plaintext_sha256,
+                               "reencryption_failed", scan_elapsed_ms(&ts_start));
+            atomic_fetch_sub(&g_inflight, 1);
+            return send_error(fd, "reencryption_failed");
         }
 
         char nonce_b64[48];
@@ -779,19 +823,25 @@ static int handle_scan(int fd, cJSON *json)
         if (scanner_sign_output_via_signer(ct_digest,
                                            result.tee_signature_ed25519,
                                            result.tee_signature_mldsa) != 0) {
-            fail_reason = "tee_sign_failed";
-            goto scan_failed;
+            sodium_memzero(sanitized, sanitized_len);
+            free(sanitized);
+            sodium_memzero(plaintext, plaintext_len);
+            free(plaintext);
+            sodium_memzero(data_key, sizeof(data_key));
+            tee_admission_release(&g_inflight_bytes, reserve_bytes);
+            audit_scan_failure(req.user_id, req.meta_plaintext_sha256,
+                               "tee_sign_failed", scan_elapsed_ms(&ts_start));
+            atomic_fetch_sub(&g_inflight, 1);
+            return send_error(fd, "tee_sign_failed");
         }
         result.has_tee_signature = 1;
 
         sodium_memzero(sanitized, sanitized_len);
         free(sanitized);
-        sanitized = NULL;
     }
 
     sodium_memzero(plaintext, plaintext_len);
     free(plaintext);
-    plaintext = NULL;
     sodium_memzero(data_key, sizeof(data_key));
 
     clock_gettime(CLOCK_MONOTONIC, &ts_end);
@@ -881,25 +931,6 @@ static int handle_scan(int fd, cJSON *json)
     tee_admission_release(&g_inflight_bytes, reserve_bytes);
     atomic_fetch_sub(&g_inflight, 1);
     return rc;
-
-scan_failed:
-    if (!fail_reason) fail_reason = "scanner_internal_error";
-    if (sanitized) {
-        sodium_memzero(sanitized, sanitized_len);
-        free(sanitized);
-    }
-    if (plaintext) {
-        sodium_memzero(plaintext, plaintext_len);
-        free(plaintext);
-    }
-    sodium_memzero(data_key, sizeof(data_key));
-    if (reserved) {
-        tee_admission_release(&g_inflight_bytes, reserve_bytes);
-    }
-    audit_scan_failure(req.user_id, req.meta_plaintext_sha256,
-                       fail_reason, scan_elapsed_ms(&ts_start));
-    atomic_fetch_sub(&g_inflight, 1);
-    return send_error(fd, fail_reason);
 }
 
 static void handle_connection(int client_fd)
@@ -1142,72 +1173,6 @@ static void *signer_worker_loop(void *arg)
     }
 }
 
-static int tee_listen_unix(const char *socket_path, int *activated_out)
-{
-    int server_fd = -1;
-    *activated_out = 0;
-
-#ifdef HAVE_SYSTEMD
-    int listen_fds = sd_listen_fds(0);
-    if (listen_fds > 1) {
-        fprintf(stderr, "FATAL: systemd passed %d listen fds, expected 1\n",
-                listen_fds);
-        return -1;
-    }
-    if (listen_fds == 1) {
-        server_fd = SD_LISTEN_FDS_START;
-        *activated_out = 1;
-        fprintf(stderr, "INFO: using socket-activated fd %d\n", server_fd);
-    }
-#endif
-
-    if (server_fd < 0) {
-        server_fd = socket(AF_UNIX, SOCK_STREAM, 0);
-        if (server_fd < 0) {
-            perror("socket");
-            return -1;
-        }
-
-        struct sockaddr_un addr;
-        memset(&addr, 0, sizeof(addr));
-        addr.sun_family = AF_UNIX;
-        snprintf(addr.sun_path, sizeof(addr.sun_path), "%s", socket_path);
-
-        unlink(socket_path);
-
-        if (bind(server_fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
-            perror("bind");
-            close(server_fd);
-            return -1;
-        }
-
-        chmod(socket_path, 0660);
-
-        if (listen(server_fd, 64) < 0) {
-            perror("listen");
-            close(server_fd);
-            unlink(socket_path);
-            return -1;
-        }
-    }
-
-    fcntl(server_fd, F_SETFD, FD_CLOEXEC);
-    return server_fd;
-}
-
-static int tee_start_workers(pthread_t *workers, void *(*loop)(void *),
-                             const char *role)
-{
-    tee_queue_init(&g_queue);
-    for (int i = 0; i < WORKER_POOL_SIZE; i++) {
-        if (pthread_create(&workers[i], NULL, loop, NULL) != 0) {
-            fprintf(stderr, "FATAL: pthread_create %s worker %d failed\n", role, i);
-            return -1;
-        }
-    }
-    return 0;
-}
-
 static int run_signer(const char *socket_path)
 {
     struct passwd *pw = getpwnam("pigcloud-tee");
@@ -1232,12 +1197,48 @@ static int run_signer(const char *socket_path)
     sigaction(SIGINT, &sa, NULL);
     signal(SIGPIPE, SIG_IGN);
 
+    int server_fd = -1;
     int socket_activated = 0;
-    int server_fd = tee_listen_unix(socket_path, &socket_activated);
-    if (server_fd < 0) {
+#ifdef HAVE_SYSTEMD
+    int listen_fds = sd_listen_fds(0);
+    if (listen_fds > 1) {
+        fprintf(stderr, "FATAL: systemd passed %d listen fds, expected 1\n", listen_fds);
         attestation_destroy();
         return 1;
     }
+    if (listen_fds == 1) {
+        server_fd = SD_LISTEN_FDS_START;
+        socket_activated = 1;
+    }
+#endif
+    if (server_fd < 0) {
+        server_fd = socket(AF_UNIX, SOCK_STREAM, 0);
+        if (server_fd < 0) {
+            perror("socket");
+            attestation_destroy();
+            return 1;
+        }
+        struct sockaddr_un addr;
+        memset(&addr, 0, sizeof(addr));
+        addr.sun_family = AF_UNIX;
+        snprintf(addr.sun_path, sizeof(addr.sun_path), "%s", socket_path);
+        unlink(socket_path);
+        if (bind(server_fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+            perror("bind");
+            close(server_fd);
+            attestation_destroy();
+            return 1;
+        }
+        chmod(socket_path, 0660);
+        if (listen(server_fd, 64) < 0) {
+            perror("listen");
+            close(server_fd);
+            unlink(socket_path);
+            attestation_destroy();
+            return 1;
+        }
+    }
+    fcntl(server_fd, F_SETFD, FD_CLOEXEC);
 
     g_start_time = time(NULL);
     fprintf(stderr, "INFO: signer listening on %s%s (workers=%d)\n", socket_path,
@@ -1247,9 +1248,13 @@ static int run_signer(const char *socket_path)
         return 1;
     }
 
+    tee_queue_init(&g_queue);
     pthread_t workers[WORKER_POOL_SIZE];
-    if (tee_start_workers(workers, signer_worker_loop, "signer") != 0) {
-        return 1;
+    for (int i = 0; i < WORKER_POOL_SIZE; i++) {
+        if (pthread_create(&workers[i], NULL, signer_worker_loop, NULL) != 0) {
+            fprintf(stderr, "FATAL: pthread_create signer worker %d failed\n", i);
+            return 1;
+        }
     }
 
 #ifdef HAVE_SYSTEMD
@@ -1450,13 +1455,62 @@ int main(int argc, char *argv[])
     sa_hup.sa_flags = SA_RESTART;
     sigaction(SIGHUP, &sa_hup, NULL);
 
+    int server_fd = -1;
     int socket_activated = 0;
-    int server_fd = tee_listen_unix(socket_path, &socket_activated);
-    if (server_fd < 0) {
+
+#ifdef HAVE_SYSTEMD
+    int listen_fds = sd_listen_fds(0);
+    if (listen_fds > 1) {
+        fprintf(stderr, "FATAL: systemd passed %d listen fds, expected 1\n",
+                listen_fds);
         scanner_destroy();
         attestation_destroy();
         return 1;
     }
+    if (listen_fds == 1) {
+        server_fd = SD_LISTEN_FDS_START;
+        socket_activated = 1;
+        fprintf(stderr, "INFO: using socket-activated fd %d\n", server_fd);
+    }
+#endif
+
+    if (server_fd < 0) {
+        server_fd = socket(AF_UNIX, SOCK_STREAM, 0);
+        if (server_fd < 0) {
+            perror("socket");
+            scanner_destroy();
+            attestation_destroy();
+            return 1;
+        }
+
+        struct sockaddr_un addr;
+        memset(&addr, 0, sizeof(addr));
+        addr.sun_family = AF_UNIX;
+        snprintf(addr.sun_path, sizeof(addr.sun_path), "%s", socket_path);
+
+        unlink(socket_path);
+
+        if (bind(server_fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+            perror("bind");
+            close(server_fd);
+            scanner_destroy();
+            attestation_destroy();
+            return 1;
+        }
+
+        chmod(socket_path, 0660);
+
+        if (listen(server_fd, 64) < 0) {
+            perror("listen");
+            close(server_fd);
+            unlink(socket_path);
+            scanner_destroy();
+            attestation_destroy();
+            return 1;
+        }
+    }
+
+    fcntl(server_fd, F_SETFD, FD_CLOEXEC);
 
     g_start_time = time(NULL);
     fprintf(stderr, "INFO: listening on %s%s (workers=%d)\n", socket_path,
@@ -1467,8 +1521,12 @@ int main(int argc, char *argv[])
         return 1;
     }
 
-    if (tee_start_workers(g_workers, worker_loop, "scanner") != 0) {
-        return 1;
+    tee_queue_init(&g_queue);
+    for (int i = 0; i < WORKER_POOL_SIZE; i++) {
+        if (pthread_create(&g_workers[i], NULL, worker_loop, NULL) != 0) {
+            fprintf(stderr, "FATAL: pthread_create worker %d failed\n", i);
+            return 1;
+        }
     }
 
 #ifdef HAVE_SYSTEMD
