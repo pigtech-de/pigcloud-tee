@@ -1,0 +1,9 @@
+# Local build output. The enclave now compiles in the dev container, so these
+# appear on any `make` run; the root .gitignore only covers the generated
+# whitelist and two of the test binaries.
+*.o
+pigcloud-tee-scanner
+tests/spawn_harden_test
+manifest
+manifest.sgx
+enclave_signing_key.pem

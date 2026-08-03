@@ -9,23 +9,6 @@
 #include "sanitizers.h"
 #include "memfd_helpers.h"
 
-static const char *GS_CANDIDATES[] = {
-    "/usr/bin/gs",
-    "/usr/local/bin/gs",
-    "gs",
-    NULL
-};
-
-static const char *find_gs(void)
-{
-    for (int i = 0; GS_CANDIDATES[i]; i++) {
-        if (access(GS_CANDIDATES[i], X_OK) == 0) {
-            return GS_CANDIDATES[i];
-        }
-    }
-    return NULL;
-}
-
 int sanitize_pdf(
     const unsigned char *data, size_t len,
     unsigned char **out, size_t *out_len,
@@ -39,39 +22,28 @@ int sanitize_pdf(
         return SANITIZE_REJECTED;
     }
 
-    const char *gs = find_gs();
+    const char *gs = tee_find_binary(TEE_GS_CANDIDATES);
     if (!gs) {
         snprintf(reason, reason_size, "ghostscript_not_installed");
         return SANITIZE_ERROR;
     }
 
-    char in_path[64], out_path[64], meta_path[64];
-
-    int in_fd = tee_memfd_create("tee_pdf_in", in_path, sizeof(in_path));
-    if (in_fd < 0) {
-        snprintf(reason, reason_size, "memfd_create_failed");
+    tee_memfd_pair_t io;
+    const char *memfd_reason = NULL;
+    if (tee_memfd_pair_open(&io, "tee_pdf_in", "tee_pdf_out",
+                            data, len, &memfd_reason) != 0) {
+        snprintf(reason, reason_size, "%s", memfd_reason);
         return SANITIZE_ERROR;
     }
-
-    int out_fd = tee_memfd_create("tee_pdf_out", out_path, sizeof(out_path));
-    if (out_fd < 0) {
-        close(in_fd);
-        snprintf(reason, reason_size, "memfd_create_failed");
-        return SANITIZE_ERROR;
-    }
-
-    if (tee_memfd_write(in_fd, data, len) != 0) {
-        close(in_fd);
-        close(out_fd);
-        snprintf(reason, reason_size, "memfd_write_failed");
-        return SANITIZE_ERROR;
-    }
+    int in_fd = io.in_fd;
+    int out_fd = io.out_fd;
 
     static const char meta_script[] =
         "[/Title () /Author () /Subject () /Keywords () "
         "/Creator () /Producer () /CreationDate () /ModDate () "
         "/Metadata null /DOCINFO pdfmark\n";
 
+    char meta_path[TEE_MEMFD_PATH_MAX];
     int meta_fd = tee_memfd_create("tee_pdf_meta", meta_path, sizeof(meta_path));
     if (meta_fd < 0) {
         close(in_fd);
@@ -88,57 +60,41 @@ int sanitize_pdf(
         return SANITIZE_ERROR;
     }
 
-    int timeout_secs = TEE_SUBPROC_WALL_CAP_SECS;
+    struct timespec scan_deadline;
+    clock_gettime(CLOCK_MONOTONIC, &scan_deadline);
+    scan_deadline.tv_sec += TEE_SCAN_CONVERTER_BUDGET_SECS;
 
-    pid_t pid = fork();
-    if (pid < 0) {
-        close(in_fd);
-        close(out_fd);
-        close(meta_fd);
-        snprintf(reason, reason_size, "fork_failed");
-        return SANITIZE_ERROR;
-    }
+    int timeout_secs = tee_secs_until(&scan_deadline);
+    if (timeout_secs > TEE_SUBPROC_WALL_CAP_SECS) timeout_secs = TEE_SUBPROC_WALL_CAP_SECS;
 
-    if (pid == 0) {
-        int devnull = open("/dev/null", O_WRONLY | O_CLOEXEC);
-        if (devnull >= 0) {
-            dup2(devnull, STDOUT_FILENO);
-            dup2(devnull, STDERR_FILENO);
-            if (devnull > STDERR_FILENO) close(devnull);
-        }
+    char *const gs_args[] = {
+        (char *)gs,
+        "-dSAFER", "-dNOPAUSE", "-dBATCH", "-dQUIET",
+        "-sDEVICE=pdfwrite",
+        "-dCompatibilityLevel=1.7",
+        "-dPDFSETTINGS=/default",
+        "-dDetectDuplicateImages=true",
+        "-dColorImageDownsample=false",
+        "-dGrayImageDownsample=false",
+        "-dMonoImageDownsample=false",
+        "-o", io.out_path,
+        io.in_path,
+        meta_path,
+        NULL
+    };
 
-        tee_keep_after_exec(in_fd);
-        tee_keep_after_exec(out_fd);
-        tee_keep_after_exec(meta_fd);
-        tee_harden_child((rlim_t)timeout_secs * 4 + 30);
-
-        execl(gs, gs,
-              "-dSAFER", "-dNOPAUSE", "-dBATCH", "-dQUIET",
-              "-sDEVICE=pdfwrite",
-              "-dCompatibilityLevel=1.7",
-              "-dPDFSETTINGS=/default",
-              "-dDetectDuplicateImages=true",
-              "-dColorImageDownsample=false",
-              "-dGrayImageDownsample=false",
-              "-dMonoImageDownsample=false",
-              "-o", out_path,
-              in_path,
-              meta_path,
-              (char *)NULL);
-        _exit(127);
-    }
-
-    int status = 0;
-    int wait_rc = tee_wait_child(pid, timeout_secs, &status);
+    int wait_rc = tee_spawn_converter(gs, gs_args, timeout_secs,
+                                      (const int[]){in_fd, out_fd, meta_fd}, 3);
 
     close(in_fd);
     close(meta_fd);
 
     if (wait_rc != TEE_SUBPROC_OK) {
         close(out_fd);
-        snprintf(reason, reason_size, "%s",
-                 wait_rc == TEE_SUBPROC_TIMEOUT ? "ghostscript_timeout"
-                                                : "ghostscript_failed");
+        const char *why = "ghostscript_failed";
+        if (wait_rc == TEE_SUBPROC_TIMEOUT)         why = "ghostscript_timeout";
+        else if (wait_rc == TEE_SUBPROC_SPAWN_FAIL) why = "fork_failed";
+        snprintf(reason, reason_size, "%s", why);
         return SANITIZE_ERROR;
     }
 

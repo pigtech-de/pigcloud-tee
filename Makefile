@@ -61,7 +61,7 @@ SYSTEMD_DIR  = /etc/systemd/system
 LOGROTATE_DIR = /etc/logrotate.d
 SCRIPTS_DIR  = $(PREFIX)/lib/pigcloud-tee
 
-.PHONY: all clean install uninstall test test-e2e e2e-self-check setup-user deploy vector-check admission-test
+.PHONY: all clean install uninstall test test-e2e e2e-self-check setup-user deploy vector-check admission-test spawn-test
 
 all: $(BIN)
 
@@ -78,7 +78,7 @@ main.o: main.c protocol.h admission.h crypto.h attestation.h audit.h scanner.h v
 admission.o: admission.c admission.h protocol.h vendor/cjson/cJSON.h
 crypto.o: crypto.c crypto.h protocol.h
 attestation.o: attestation.c attestation.h
-audit.o: audit.c audit.h vendor/cjson/cJSON.h
+audit.o: audit.c audit.h protocol.h vendor/cjson/cJSON.h
 scanner.o: scanner.c scanner.h clamav.h yara.h protocol.h sanitizers/sanitizers.h $(WHITELIST_H)
 scanner_whitelist.o: $(WHITELIST_C) $(WHITELIST_H)
 clamav.o: clamav.c clamav.h protocol.h
@@ -93,7 +93,7 @@ sanitizers/video.o: sanitizers/video.c sanitizers/sanitizers.h protocol.h saniti
 sanitizers/audio.o: sanitizers/audio.c sanitizers/sanitizers.h protocol.h sanitizers/memfd_helpers.h $(WHITELIST_H)
 
 clean:
-	rm -f $(OBJS) $(BIN) $(WHITELIST_H) $(WHITELIST_C) tests/vector_check tests/admission_harness
+	rm -f $(OBJS) $(BIN) $(WHITELIST_H) $(WHITELIST_C) tests/vector_check tests/admission_harness tests/spawn_harden_test
 
 setup-user:
 	@if ! id pigcloud-tee >/dev/null 2>&1; then \
@@ -174,6 +174,12 @@ tests/vector_check: tests/vector_check.c crypto.c crypto.h protocol.h vendor/cjs
 
 admission-test: tests/admission_harness
 	./tests/admission_harness
+
+spawn-test: tests/spawn_harden_test
+	./tests/spawn_harden_test
+
+tests/spawn_harden_test: tests/spawn_harden_test.c sanitizers/memfd_helpers.h
+	$(CC) -O2 -Wall -Wextra -std=c11 -o $@ tests/spawn_harden_test.c
 
 tests/admission_harness: tests/admission_harness.c admission.c admission.h protocol.h \
                          deploy/monitor-cron.sh vendor/cjson/cJSON.c vendor/cjson/cJSON.h

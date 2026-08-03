@@ -45,7 +45,7 @@ uint64_t audit_write_failures(void)
 static pthread_mutex_t g_audit_mutex = PTHREAD_MUTEX_INITIALIZER;
 static char            g_audit_date[11] = "";
 static uint64_t        g_audit_seq = 0;
-static char            g_audit_prev[65] = AUDIT_GENESIS_PREV;
+static char            g_audit_prev[SHA256_HEX_BUF] = AUDIT_GENESIS_PREV;
 static ino_t           g_audit_inode = 0;
 
 static volatile sig_atomic_t g_audit_reseed = 0;
@@ -88,7 +88,7 @@ static int build_canonical_and_sign(const audit_entry_t *entry,
                                     const char *log_date,
                                     const char *prev_hex,
                                     uint64_t seq,
-                                    char sig_hex[65],
+                                    char sig_hex[SHA256_HEX_BUF],
                                     char **canonical_out)
 {
     cJSON *canonical = cJSON_CreateObject();
@@ -204,7 +204,8 @@ static void audit_reseed_from_tail(int fd)
     cJSON *seq_item = cJSON_GetObjectItemCaseSensitive(rec, "seq");
     cJSON *sig_item = cJSON_GetObjectItemCaseSensitive(rec, "sig");
     if (!cJSON_IsNumber(seq_item) || !cJSON_IsString(sig_item) ||
-        !sig_item->valuestring || strlen(sig_item->valuestring) != 64) {
+        !sig_item->valuestring ||
+        strlen(sig_item->valuestring) != SHA256_HEX_LEN) {
         cJSON_Delete(rec);
         fprintf(stderr, "WARN: audit last line missing seq/sig; visible genesis reset\n");
         audit_set_genesis();
@@ -213,8 +214,8 @@ static void audit_reseed_from_tail(int fd)
 
     double seqd = seq_item->valuedouble;
     g_audit_seq = (seqd < 0.0) ? 0 : (uint64_t)seqd + 1;
-    memcpy(g_audit_prev, sig_item->valuestring, 64);
-    g_audit_prev[64] = '\0';
+    memcpy(g_audit_prev, sig_item->valuestring, SHA256_HEX_LEN);
+    g_audit_prev[SHA256_HEX_LEN] = '\0';
     cJSON_Delete(rec);
 }
 
@@ -276,7 +277,7 @@ void audit_record(const audit_entry_t *entry)
         memcpy(g_audit_date, log_date, sizeof(g_audit_date));
     }
 
-    char sig_hex[65];
+    char sig_hex[SHA256_HEX_BUF];
     char *canonical_json = NULL;
     if (build_canonical_and_sign(entry, ts, log_date, g_audit_prev,
                                  g_audit_seq, sig_hex, &canonical_json) != 0) {

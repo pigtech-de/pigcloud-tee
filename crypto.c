@@ -53,7 +53,7 @@ static void hex_encode(const unsigned char *data, size_t len, char *out)
     out[len * 2] = '\0';
 }
 
-static int sha256_hex(const unsigned char *data, size_t len, char out[65])
+static int sha256_hex(const unsigned char *data, size_t len, char out[SHA256_HEX_BUF])
 {
     unsigned char hash[crypto_hash_sha256_BYTES];
     if (crypto_hash_sha256(hash, data, len) != 0) {
@@ -415,7 +415,7 @@ decrypt_verify:
 
     unsigned char expected_bin[crypto_hash_sha256_BYTES];
     if (sodium_hex2bin(expected_bin, sizeof(expected_bin),
-                       expected_sha256, 64,
+                       expected_sha256, SHA256_HEX_LEN,
                        NULL, NULL, NULL) != 0) {
         sodium_memzero(result, total_plaintext);
         free(result);
@@ -439,7 +439,7 @@ int tee_encrypt_file(
     const char *output_path,
     unsigned char new_nonce_out[E2EE_NONCE_SIZE],
     int *new_chunks_out,
-    char new_sha256_out[65],
+    char new_sha256_out[SHA256_HEX_BUF],
     tee_output_digest_t *ciphertext_digest_out)
 {
     unsigned char nonce[E2EE_NONCE_SIZE];
@@ -566,7 +566,7 @@ int tee_verify_metadata_mac(
 
     unsigned char expected_bin[crypto_auth_hmacsha256_BYTES];
     if (sodium_hex2bin(expected_bin, sizeof(expected_bin),
-                       expected_mac_hex, 64,
+                       expected_mac_hex, SHA256_HEX_LEN,
                        NULL, NULL, NULL) != 0) {
         return -1;
     }
@@ -580,7 +580,7 @@ int tee_compute_metadata_mac(
     const unsigned char data_key[E2EE_KEY_SIZE],
     int version, const char *nonce_b64, int chunk_size, int chunks,
     const char *plaintext_sha256, int64_t plaintext_size,
-    char mac_hex_out[65])
+    char mac_hex_out[SHA256_HEX_BUF])
 {
     char canonical[1024];
     int clen = build_metadata_canonical(
