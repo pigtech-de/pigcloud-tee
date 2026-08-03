@@ -1,0 +1,86 @@
+[loader]
+entrypoint = "file:{{ gramine.libos }}"
+log_level = "{{ log_level }}"
+
+[loader.env]
+LD_LIBRARY_PATH = "/lib:{{ arch_libdir }}:/usr/lib:/usr/{{ arch_libdir }}"
+TEE_AUDIT_HMAC_KEY = { passthrough = true }
+TEE_SECCOMP_MODE = { passthrough = true }
+
+[[loader.argv]]
+value = "pigcloud-tee-scanner"
+
+[libos]
+entrypoint = "/pigcloud-tee-scanner"
+
+[sgx]
+debug = false
+enclave_size = "256M"
+max_threads = 4
+isvprodid = 1
+isvsvn = 1
+remote_attestation = "epid"
+
+[sys]
+enable_sigterm_injection = true
+
+[fs]
+mounts = [
+    { path = "/lib",                uri = "file:{{ gramine.runtimedir() }}" },
+    { path = "{{ arch_libdir }}",   uri = "file:{{ arch_libdir }}" },
+    { path = "/usr/{{ arch_libdir }}", uri = "file:/usr/{{ arch_libdir }}" },
+    { path = "/etc",                uri = "file:/etc" },
+    { path = "/uploads",            uri = "file:/var/www/pigtech/private/uploads", type = "chroot" },
+    { path = "/tmp",                uri = "file:/tmp/pigcloud-tee", type = "chroot" },
+]
+
+[[sgx.trusted_files]]
+uri = "file:{{ gramine.libos }}"
+
+[[sgx.trusted_files]]
+uri = "file:pigcloud-tee-scanner"
+
+[[sgx.trusted_files]]
+uri = "file:{{ gramine.runtimedir() }}/"
+
+[[sgx.trusted_files]]
+uri = "file:{{ arch_libdir }}/libsodium.so.23"
+
+[[sgx.trusted_files]]
+uri = "file:/usr/local/lib/liboqs.so.8"
+
+[[sgx.trusted_files]]
+uri = "file:{{ arch_libdir }}/libmagic.so.1"
+
+[[sgx.trusted_files]]
+uri = "file:{{ arch_libdir }}/libgd.so.3"
+
+[[sgx.trusted_files]]
+uri = "file:{{ arch_libdir }}/libexpat.so.1"
+
+[[sgx.trusted_files]]
+uri = "file:/usr/local/lib/pigcloud-tee/ffmpeg"
+
+[[sgx.trusted_files]]
+uri = "file:/usr/bin/gs"
+
+[[sgx.allowed_files]]
+uri = "file:/var/www/pigtech/private/uploads/quarantine/"
+
+[[sgx.allowed_files]]
+uri = "file:/tmp/pigcloud-tee/"
+
+[[sgx.allowed_files]]
+uri = "file:/run/pigcloud-tee/"
+
+[[sgx.allowed_files]]
+uri = "file:/var/log/pigcloud-tee/"
+
+[[sgx.allowed_files]]
+uri = "file:/usr/local/lib/pigcloud-tee/magic.mgc"
+
+[[sgx.allowed_files]]
+uri = "file:/usr/share/misc/magic.mgc"
+
+[[sgx.allowed_files]]
+uri = "file:/var/run/clamav/"
