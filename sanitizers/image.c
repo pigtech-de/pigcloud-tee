@@ -157,6 +157,71 @@ static int gif_is_animated(const unsigned char *data, size_t len)
     return 0;
 }
 
+static void png_walk_chunks(const unsigned char *data, size_t len,
+                            int *has_actl, int *ends_at_iend)
+{
+    *has_actl = 0;
+    *ends_at_iend = 0;
+    if (len < 8) return;
+
+    size_t i = 8;
+    int seen_idat = 0;
+    for (int guard = 0; guard < 4096; guard++) {
+        if (i + 12 > len) return;
+        uint32_t clen = ((uint32_t)data[i] << 24) | ((uint32_t)data[i + 1] << 16) |
+                        ((uint32_t)data[i + 2] << 8) | (uint32_t)data[i + 3];
+        if (clen > 0x7FFFFFFFu || (size_t)clen + 12 > len - i) return;
+        const unsigned char *type = data + i + 4;
+        if (!seen_idat && clen == 8 && memcmp(type, "acTL", 4) == 0) {
+            const unsigned char *p = data + i + 8;
+            uint32_t frames = ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) |
+                              ((uint32_t)p[2] << 8) | (uint32_t)p[3];
+            *has_actl = (frames > 1);
+        }
+        if (memcmp(type, "IDAT", 4) == 0) {
+            seen_idat = 1;
+        }
+        if (memcmp(type, "IEND", 4) == 0) {
+            *ends_at_iend = (i + 12 + (size_t)clen == len);
+            return;
+        }
+        i += 12 + (size_t)clen;
+    }
+}
+
+static void webp_walk_chunks(const unsigned char *data, size_t len,
+                             int *has_anim, int *exact_riff)
+{
+    *has_anim = 0;
+    *exact_riff = 0;
+    if (len < 12 || memcmp(data, "RIFF", 4) != 0 || memcmp(data + 8, "WEBP", 4) != 0) {
+        return;
+    }
+    uint32_t riff_size = (uint32_t)data[4] | ((uint32_t)data[5] << 8) |
+                         ((uint32_t)data[6] << 16) | ((uint32_t)data[7] << 24);
+    int size_exact = ((size_t)riff_size + 8 == len);
+
+    size_t i = 12;
+    int seen_anim = 0, frames = 0;
+    for (int guard = 0; guard < 4096; guard++) {
+        if (i == len) { *exact_riff = size_exact; break; }
+        if (i + 8 > len) break;
+        uint32_t csize = (uint32_t)data[i + 4] | ((uint32_t)data[i + 5] << 8) |
+                         ((uint32_t)data[i + 6] << 16) | ((uint32_t)data[i + 7] << 24);
+        if (csize > 0x7FFFFFFFu) break;
+        size_t padded = (size_t)csize + ((csize & 1u) ? 1u : 0u);
+        if (padded + 8 > len - i) break;
+        if (memcmp(data + i, "ANIM", 4) == 0) {
+            seen_anim = 1;
+        }
+        if (memcmp(data + i, "ANMF", 4) == 0) {
+            frames++;
+        }
+        i += 8 + padded;
+    }
+    *has_anim = (seen_anim && frames > 0);
+}
+
 static int ext_is_opaque(const char *ext)
 {
     if (!ext || ext[0] == '\0') return 0;
@@ -214,6 +279,32 @@ int sanitize_raster_image(
         }
         snprintf(reason, reason_size, "gif_animated_passthrough");
         return SANITIZE_CLEAN;
+    }
+
+    if (type == IMG_PNG) {
+        int has_actl = 0, ends_at_iend = 0;
+        png_walk_chunks(data, len, &has_actl, &ends_at_iend);
+        if (has_actl) {
+            if (!ends_at_iend) {
+                snprintf(reason, reason_size, "png_trailing_data");
+                return SANITIZE_REJECTED;
+            }
+            snprintf(reason, reason_size, "png_animated_passthrough");
+            return SANITIZE_CLEAN;
+        }
+    }
+
+    if (type == IMG_WEBP) {
+        int has_anim = 0, exact_riff = 0;
+        webp_walk_chunks(data, len, &has_anim, &exact_riff);
+        if (has_anim) {
+            if (!exact_riff) {
+                snprintf(reason, reason_size, "webp_trailing_data");
+                return SANITIZE_REJECTED;
+            }
+            snprintf(reason, reason_size, "webp_animated_passthrough");
+            return SANITIZE_CLEAN;
+        }
     }
 
     gdImagePtr img = decode_image(data, len, type);

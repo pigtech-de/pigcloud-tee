@@ -61,7 +61,7 @@ SYSTEMD_DIR  = /etc/systemd/system
 LOGROTATE_DIR = /etc/logrotate.d
 SCRIPTS_DIR  = $(PREFIX)/lib/pigcloud-tee
 
-.PHONY: all clean install uninstall test test-e2e e2e-self-check setup-user deploy vector-check admission-test spawn-test
+.PHONY: all clean install uninstall test test-e2e e2e-self-check setup-user deploy vector-check admission-test spawn-test image-test
 
 all: $(BIN)
 
@@ -93,7 +93,7 @@ sanitizers/video.o: sanitizers/video.c sanitizers/sanitizers.h protocol.h saniti
 sanitizers/audio.o: sanitizers/audio.c sanitizers/sanitizers.h protocol.h sanitizers/memfd_helpers.h $(WHITELIST_H)
 
 clean:
-	rm -f $(OBJS) $(BIN) $(WHITELIST_H) $(WHITELIST_C) tests/vector_check tests/admission_harness tests/spawn_harden_test
+	rm -f $(OBJS) $(BIN) $(WHITELIST_H) $(WHITELIST_C) tests/vector_check tests/admission_harness tests/spawn_harden_test tests/image_anim_test
 
 setup-user:
 	@if ! id pigcloud-tee >/dev/null 2>&1; then \
@@ -180,6 +180,12 @@ spawn-test: tests/spawn_harden_test
 
 tests/spawn_harden_test: tests/spawn_harden_test.c sanitizers/memfd_helpers.h
 	$(CC) -O2 -Wall -Wextra -std=c11 -o $@ tests/spawn_harden_test.c
+
+image-test: tests/image_anim_test
+	./tests/image_anim_test
+
+tests/image_anim_test: tests/image_anim_test.c sanitizers/image.c sanitizers/sanitizers.h $(WHITELIST_H) $(WHITELIST_C)
+	$(CC) $(CFLAGS) -o $@ tests/image_anim_test.c $(WHITELIST_C) -lgd
 
 tests/admission_harness: tests/admission_harness.c admission.c admission.h protocol.h \
                          deploy/monitor-cron.sh vendor/cjson/cJSON.c vendor/cjson/cJSON.h
