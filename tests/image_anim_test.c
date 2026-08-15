@@ -86,6 +86,84 @@ static size_t build_webp(unsigned char *buf, int animated, const char *extra_typ
     return total;
 }
 
+static size_t build_gif(unsigned char *buf, int frames, int netscape,
+                        const unsigned char *tail, size_t tail_len)
+{
+    memcpy(buf, "GIF89a", 6);
+    size_t at = 6;
+    buf[at++] = 4; buf[at++] = 0;
+    buf[at++] = 4; buf[at++] = 0;
+    buf[at++] = 0x80;
+    buf[at++] = 0;
+    buf[at++] = 0;
+    for (int c = 0; c < 6; c++) buf[at++] = 0;
+
+    if (netscape) {
+        buf[at++] = 0x21; buf[at++] = 0xFF; buf[at++] = 0x0B;
+        memcpy(buf + at, "NETSCAPE2.0", 11); at += 11;
+        buf[at++] = 3; buf[at++] = 1; buf[at++] = 0; buf[at++] = 0;
+        buf[at++] = 0;
+    }
+
+    for (int f = 0; f < frames; f++) {
+        buf[at++] = 0x2C;
+        buf[at++] = 0; buf[at++] = 0;
+        buf[at++] = 0; buf[at++] = 0;
+        buf[at++] = 4; buf[at++] = 0;
+        buf[at++] = 4; buf[at++] = 0;
+        buf[at++] = 0;
+        buf[at++] = 2;
+        buf[at++] = 3;
+        buf[at++] = 0x84; buf[at++] = 0x8F; buf[at++] = 0xA9;
+        buf[at++] = 0;
+    }
+
+    buf[at++] = 0x3B;
+    if (tail && tail_len) { memcpy(buf + at, tail, tail_len); at += tail_len; }
+    return at;
+}
+
+static void gif_cases(void)
+{
+    unsigned char buf[4096];
+    int frames, trailer;
+
+    size_t n = build_gif(buf, 3, 1, NULL, 0);
+    gif_walk_blocks(buf, n, &frames, &trailer);
+    check("animated gif: three frames counted", frames == 3);
+    check("animated gif: lands on trailer", trailer == 1);
+
+    n = build_gif(buf, 1, 1, NULL, 0);
+    gif_walk_blocks(buf, n, &frames, &trailer);
+    check("still gif carrying NETSCAPE2.0 counts one frame", frames == 1);
+
+    n = build_gif(buf, 1, 0, NULL, 0);
+    gif_walk_blocks(buf, n, &frames, &trailer);
+    check("plain still gif counts one frame", frames == 1);
+
+    n = build_gif(buf, 2, 0, NULL, 0);
+    gif_walk_blocks(buf, n, &frames, &trailer);
+    check("animated gif without NETSCAPE2.0 counts frames", frames == 2);
+
+    const unsigned char sneaky[] = {0x41, 0x41, 0x3B};
+    n = build_gif(buf, 2, 1, sneaky, sizeof sneaky);
+    gif_walk_blocks(buf, n, &frames, &trailer);
+    check("appended payload ending in 0x3B is not the trailer", trailer == 0);
+
+    const unsigned char junk[] = {0x41, 0x41, 0x41, 0x41};
+    n = build_gif(buf, 2, 1, junk, sizeof junk);
+    gif_walk_blocks(buf, n, &frames, &trailer);
+    check("appended payload after trailer detected", frames == 2 && trailer == 0);
+
+    gif_walk_blocks(buf, 8, &frames, &trailer);
+    check("truncated gif: no crash, no frames", frames == 0 && trailer == 0);
+
+    unsigned char notgif[64];
+    memset(notgif, 0x41, sizeof notgif);
+    gif_walk_blocks(notgif, sizeof notgif, &frames, &trailer);
+    check("non-gif buffer counts no frames", frames == 0);
+}
+
 static void png_cases(void)
 {
     unsigned char buf[4096];
@@ -189,9 +267,31 @@ static void sanitize_cases(void)
     size_t out_len = 0;
     char reason[256];
 
-    size_t n = build_png(buf, 1, NULL, NULL, 0, 0);
-    int rc = sanitize_raster_image(buf, n, "image/png", "png", &out, &out_len,
+    size_t n = build_gif(buf, 3, 1, NULL, 0);
+    int rc = sanitize_raster_image(buf, n, "image/gif", "gif", &out, &out_len,
                                    reason, sizeof reason);
+    check("animated gif verdict is CLEAN passthrough",
+          rc == SANITIZE_CLEAN && strcmp(reason, "gif_animated_passthrough") == 0);
+    free(out); out = NULL;
+
+    n = build_gif(buf, 1, 1, NULL, 0);
+    rc = sanitize_raster_image(buf, n, "image/gif", "gif", &out, &out_len,
+                               reason, sizeof reason);
+    check("still gif with NETSCAPE2.0 is not passed through",
+          !(rc == SANITIZE_CLEAN && strcmp(reason, "gif_animated_passthrough") == 0));
+    free(out); out = NULL;
+
+    const unsigned char gjunk[] = {0x41, 0x41, 0x3B};
+    n = build_gif(buf, 2, 1, gjunk, sizeof gjunk);
+    rc = sanitize_raster_image(buf, n, "image/gif", "gif", &out, &out_len,
+                               reason, sizeof reason);
+    check("animated gif with appended payload REJECTED",
+          rc == SANITIZE_REJECTED && strcmp(reason, "gif_trailing_data") == 0);
+    free(out); out = NULL;
+
+    n = build_png(buf, 1, NULL, NULL, 0, 0);
+    rc = sanitize_raster_image(buf, n, "image/png", "png", &out, &out_len,
+                               reason, sizeof reason);
     check("apng verdict is CLEAN passthrough",
           rc == SANITIZE_CLEAN && strcmp(reason, "png_animated_passthrough") == 0);
     free(out); out = NULL;
@@ -240,7 +340,8 @@ static void sanitize_cases(void)
 
 int main(void)
 {
-    printf("== png ==\n");        png_cases();
+    printf("== gif ==\n");        gif_cases();
+    printf("\n== png ==\n");      png_cases();
     printf("\n== webp ==\n");     webp_cases();
     printf("\n== sanitize ==\n"); sanitize_cases();
     printf("\n%s\n", g_fail ? "FAILURES" : "all passed");

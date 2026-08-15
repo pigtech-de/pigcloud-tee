@@ -142,19 +142,67 @@ static void *encode_image(gdImagePtr img, image_type_t type, int *out_size)
     }
 }
 
-static int gif_is_animated(const unsigned char *data, size_t len)
+static int gif_skip_subblocks(const unsigned char *data, size_t len, size_t *i)
 {
-    static const char ids[2][12] = { "NETSCAPE2.0", "ANIMEXTS1.0" };
-    for (size_t i = 0; i + 14 <= len && i < 4096; i++) {
-        if (data[i] != 0x21 || data[i + 1] != 0xFF || data[i + 2] != 0x0B) {
-            continue;
-        }
-        if (memcmp(data + i + 3, ids[0], 11) == 0 ||
-            memcmp(data + i + 3, ids[1], 11) == 0) {
-            return 1;
-        }
+    for (int guard = 0; guard < GIF_MAX_BLOCKS; guard++) {
+        if (*i >= len) return 0;
+        unsigned char n = data[*i];
+        (*i)++;
+        if (n == 0) return 1;
+        if ((size_t)n > len - *i) return 0;
+        *i += n;
     }
     return 0;
+}
+
+static void gif_walk_blocks(const unsigned char *data, size_t len,
+                            int *frames, int *ends_at_trailer)
+{
+    *frames = 0;
+    *ends_at_trailer = 0;
+    if (len < 13) return;
+    if (memcmp(data, "GIF87a", 6) != 0 && memcmp(data, "GIF89a", 6) != 0) return;
+
+    size_t i = 6;
+    if (i + 7 > len) return;
+    unsigned char screen = data[i + 4];
+    i += 7;
+    if (screen & 0x80) {
+        size_t gct = 3u << ((screen & 0x07) + 1);
+        if (gct > len - i) return;
+        i += gct;
+    }
+
+    for (int guard = 0; guard < GIF_MAX_BLOCKS; guard++) {
+        if (i >= len) return;
+        unsigned char block = data[i];
+        if (block == 0x3B) {
+            *ends_at_trailer = (i + 1 == len);
+            return;
+        }
+        if (block == 0x21) {
+            if (i + 2 > len) return;
+            i += 2;
+            if (!gif_skip_subblocks(data, len, &i)) return;
+            continue;
+        }
+        if (block == 0x2C) {
+            if (i + 10 > len) return;
+            unsigned char local = data[i + 9];
+            i += 10;
+            if (local & 0x80) {
+                size_t lct = 3u << ((local & 0x07) + 1);
+                if (lct > len - i) return;
+                i += lct;
+            }
+            if (i >= len) return;
+            i++;
+            if (!gif_skip_subblocks(data, len, &i)) return;
+            (*frames)++;
+            continue;
+        }
+        return;
+    }
 }
 
 static void png_walk_chunks(const unsigned char *data, size_t len,
@@ -272,8 +320,12 @@ int sanitize_raster_image(
         }
     }
 
-    if (type == IMG_GIF && gif_is_animated(data, len)) {
-        if (data[len - 1] != 0x3B) {
+    int gif_frames = 0, gif_ends_at_trailer = 0;
+    if (type == IMG_GIF) {
+        gif_walk_blocks(data, len, &gif_frames, &gif_ends_at_trailer);
+    }
+    if (type == IMG_GIF && gif_frames > 1) {
+        if (!gif_ends_at_trailer) {
             snprintf(reason, reason_size, "gif_trailing_data");
             return SANITIZE_REJECTED;
         }
