@@ -172,6 +172,16 @@ vector-check: tests/vector_check
 tests/vector_check: tests/vector_check.c crypto.c crypto.h protocol.h vendor/cjson/cJSON.c vendor/cjson/cJSON.h
 	$(CC) $(CFLAGS) -o $@ tests/vector_check.c crypto.c vendor/cjson/cJSON.c -lsodium -loqs
 
+vector-check-gate:
+	@if $(CC) $(CFLAGS) -o tests/.oqs_derand_probe tests/oqs_derand_probe.c -lsodium -loqs >/dev/null 2>&1; then \
+		rm -f tests/.oqs_derand_probe; \
+		echo "liboqs generic derand API present: the conformance verifier must build"; \
+		$(MAKE) --no-print-directory vector-check; \
+	else \
+		rm -f tests/.oqs_derand_probe; \
+		echo "::warning::TEE C conformance verifier deferred: this toolchain cannot compile against the liboqs generic OQS_KEM_keypair_derand; Go+JS verifiers cover chunked AEAD."; \
+	fi
+
 admission-test: tests/admission_harness
 	./tests/admission_harness
 
