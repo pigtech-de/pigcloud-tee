@@ -9,7 +9,7 @@ StartLimitBurst=5
 Type=notify
 ExecStart=/usr/local/bin/pigcloud-tee-scanner --role signer
 
-Environment=TEE_SECCOMP_MODE=log
+Environment=TEE_SECCOMP_MODE=enforce
 
 StateDirectory=pigcloud-tee-signer
 StateDirectoryMode=0700
