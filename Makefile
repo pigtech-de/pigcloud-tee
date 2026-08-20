@@ -119,6 +119,7 @@ install: $(BIN)
 	install -d $(SCRIPTS_DIR)
 	install -m 755 deploy/health-check.sh $(SCRIPTS_DIR)/
 	install -m 755 deploy/monitor-cron.sh $(SCRIPTS_DIR)/
+	install -m 755 deploy/update-yara.sh $(SCRIPTS_DIR)/
 	@if [ -f /usr/share/misc/magic.mgc ]; then \
 		install -m 644 /usr/share/misc/magic.mgc $(SCRIPTS_DIR)/magic.mgc; \
 		echo "Pinned libmagic DB → $(SCRIPTS_DIR)/magic.mgc"; \
