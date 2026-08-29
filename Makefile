@@ -61,7 +61,7 @@ SYSTEMD_DIR  = /etc/systemd/system
 LOGROTATE_DIR = /etc/logrotate.d
 SCRIPTS_DIR  = $(PREFIX)/lib/pigcloud-tee
 
-.PHONY: all clean install uninstall test test-e2e e2e-self-check setup-user deploy vector-check admission-test spawn-test image-test
+.PHONY: all clean install uninstall test test-e2e e2e-self-check setup-user deploy vector-check admission-test spawn-test image-test audit-ref-test
 
 all: $(BIN)
 
@@ -191,6 +191,12 @@ spawn-test: tests/spawn_harden_test
 
 tests/spawn_harden_test: tests/spawn_harden_test.c sanitizers/memfd_helpers.h
 	$(CC) -O2 -Wall -Wextra -std=c11 -o $@ tests/spawn_harden_test.c
+
+audit-ref-test: tests/audit_ref_test
+	./tests/audit_ref_test
+
+tests/audit_ref_test: tests/audit_ref_test.c audit.c audit.h protocol.h vendor/cjson/cJSON.c vendor/cjson/cJSON.h
+	$(CC) $(CFLAGS) -o $@ tests/audit_ref_test.c vendor/cjson/cJSON.c -lsodium
 
 image-test: tests/image_anim_test
 	./tests/image_anim_test

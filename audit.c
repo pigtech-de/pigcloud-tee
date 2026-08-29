@@ -26,6 +26,8 @@
 #define AUDIT_KEY_MIN       16
 #define AUDIT_KEY_MAX      256
 
+#define AUDIT_CONTENT_REF_DOMAIN "pigcloud-tee-audit-content-ref-v1"
+
 static unsigned char g_audit_key[AUDIT_KEY_MAX];
 static size_t        g_audit_key_len = 0;
 static int           g_audit_enabled = 0;
@@ -83,6 +85,26 @@ void audit_shutdown(void)
     g_audit_enabled = 0;
 }
 
+static void audit_content_ref(const char *plaintext_sha256, char out[SHA256_HEX_BUF])
+{
+    if (!plaintext_sha256 || plaintext_sha256[0] == '\0') {
+        out[0] = '\0';
+        return;
+    }
+    unsigned char mac[32];
+    crypto_auth_hmacsha256_state st;
+    crypto_auth_hmacsha256_init(&st, g_audit_key, g_audit_key_len);
+    crypto_auth_hmacsha256_update(&st,
+        (const unsigned char *)AUDIT_CONTENT_REF_DOMAIN,
+        sizeof(AUDIT_CONTENT_REF_DOMAIN) - 1);
+    crypto_auth_hmacsha256_update(&st, (const unsigned char *)plaintext_sha256,
+                                  strlen(plaintext_sha256));
+    crypto_auth_hmacsha256_final(&st, mac);
+    sodium_memzero(&st, sizeof(st));
+    sodium_bin2hex(out, SHA256_HEX_BUF, mac, sizeof(mac));
+    sodium_memzero(mac, sizeof(mac));
+}
+
 static int build_canonical_and_sign(const audit_entry_t *entry,
                                     const char *ts_rfc3339,
                                     const char *log_date,
@@ -94,9 +116,11 @@ static int build_canonical_and_sign(const audit_entry_t *entry,
     cJSON *canonical = cJSON_CreateObject();
     if (!canonical) return -1;
 
+    char content_ref[SHA256_HEX_BUF];
+    audit_content_ref(entry->plaintext_sha256, content_ref);
     cJSON_AddNumberToObject(canonical, "duration_ms", (double)entry->duration_ms);
     cJSON_AddStringToObject(canonical, "log_date", log_date);
-    cJSON_AddStringToObject(canonical, "plaintext_sha256", entry->plaintext_sha256 ? entry->plaintext_sha256 : "");
+    cJSON_AddStringToObject(canonical, "plaintext_ref", content_ref);
     cJSON_AddStringToObject(canonical, "prev", prev_hex);
     cJSON_AddStringToObject(canonical, "reason", entry->reason ? entry->reason : "");
     cJSON_AddNumberToObject(canonical, "seq", (double)seq);

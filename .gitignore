@@ -2,6 +2,7 @@
 pigcloud-tee-scanner
 tests/spawn_harden_test
 tests/image_anim_test
+tests/audit_ref_test
 manifest
 manifest.sgx
 enclave_signing_key.pem
