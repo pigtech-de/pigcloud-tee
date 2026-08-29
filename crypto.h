@@ -64,6 +64,7 @@ int tee_decrypt_file_cb(
     int meta_version,
     tee_chunk_cb chunk_cb,
     void *chunk_cb_userdata,
+    char *derived_sha256_hex,
     unsigned char **plaintext_out,
     size_t *plaintext_len
 );

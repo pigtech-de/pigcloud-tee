@@ -265,7 +265,7 @@ int tee_decrypt_file(
 {
     return tee_decrypt_file_cb(ciphertext_path, data_key, nonce,
                                expected_chunks, expected_sha256, meta_version,
-                               NULL, NULL,
+                               NULL, NULL, NULL,
                                plaintext_out, plaintext_len);
 }
 
@@ -278,11 +278,11 @@ int tee_decrypt_file_cb(
     int meta_version,
     tee_chunk_cb chunk_cb,
     void *chunk_cb_userdata,
+    char *derived_sha256_hex,
     unsigned char **plaintext_out,
     size_t *plaintext_len)
 {
-    if (expected_chunks <= 0 || !expected_sha256 || expected_sha256[0] == '\0' ||
-        meta_version < E2EE_METADATA_VERSION) {
+    if (expected_chunks <= 0 || meta_version < E2EE_METADATA_VERSION) {
         return -1;
     }
 
@@ -412,19 +412,24 @@ decrypt_verify:
 
     unsigned char computed[crypto_hash_sha256_BYTES];
     crypto_hash_sha256_final(&sha_state, computed);
-
-    unsigned char expected_bin[crypto_hash_sha256_BYTES];
-    if (sodium_hex2bin(expected_bin, sizeof(expected_bin),
-                       expected_sha256, SHA256_HEX_LEN,
-                       NULL, NULL, NULL) != 0) {
-        sodium_memzero(result, total_plaintext);
-        free(result);
-        return -1;
+    if (derived_sha256_hex) {
+        sodium_bin2hex(derived_sha256_hex, SHA256_HEX_BUF, computed, sizeof(computed));
     }
-    if (sodium_memcmp(computed, expected_bin, sizeof(computed)) != 0) {
-        sodium_memzero(result, total_plaintext);
-        free(result);
-        return -1;
+
+    if (expected_sha256 && expected_sha256[0] != '\0') {
+        unsigned char expected_bin[crypto_hash_sha256_BYTES];
+        if (sodium_hex2bin(expected_bin, sizeof(expected_bin),
+                           expected_sha256, SHA256_HEX_LEN,
+                           NULL, NULL, NULL) != 0) {
+            sodium_memzero(result, total_plaintext);
+            free(result);
+            return -1;
+        }
+        if (sodium_memcmp(computed, expected_bin, sizeof(computed)) != 0) {
+            sodium_memzero(result, total_plaintext);
+            free(result);
+            return -1;
+        }
     }
 
     *plaintext_out = result;

@@ -197,6 +197,35 @@ int main(int argc, char **argv)
           "tee_verify_metadata_mac accepts fixture MAC");
 
     {
+        char derived[SHA256_HEX_BUF] = {0};
+        unsigned char *derived_pt = NULL;
+        size_t derived_pt_len = 0;
+        int drc = tee_decrypt_file_cb(ct_path, data_key, nonce, chunks, NULL, version,
+                                      NULL, NULL, derived, &derived_pt, &derived_pt_len);
+        check(drc == 0, "decrypt succeeds without a declared digest");
+        check(drc == 0 && strcmp(derived, sha256_hex) == 0,
+              "the derived digest equals the fixture's plaintext_sha256");
+        check(drc == 0 && tee_verify_metadata_mac(data_key, version, nonce_b64, chunk_size,
+                                                  chunks, derived, plaintext_size, mac_hex) == 0,
+              "the MAC verifies against the derived digest");
+        if (derived_pt) {
+            free(derived_pt);
+        }
+
+        char wrong[SHA256_HEX_BUF];
+        memcpy(wrong, sha256_hex, SHA256_HEX_LEN + 1);
+        wrong[0] = (char)(wrong[0] == 'a' ? 'b' : 'a');
+        unsigned char *rejected_pt = NULL;
+        size_t rejected_pt_len = 0;
+        check(tee_decrypt_file_cb(ct_path, data_key, nonce, chunks, wrong, version,
+                                  NULL, NULL, NULL, &rejected_pt, &rejected_pt_len) != 0,
+              "a declared digest that disagrees with the bytes is still rejected");
+        if (rejected_pt) {
+            free(rejected_pt);
+        }
+    }
+
+    {
         unsigned char sample[4096];
         for (size_t i = 0; i < sizeof(sample); i++) {
             sample[i] = (unsigned char)(i * 7 + 1);

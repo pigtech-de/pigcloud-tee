@@ -642,6 +642,7 @@ static int handle_scan(int fd, cJSON *json)
     long long reserve_bytes = 0;
     int reserved = 0;
     const char *fail_reason = NULL;
+    char derived_sha256[SHA256_HEX_BUF] = {0};
 
     if (parse_scan_request(json, &req) != 0) {
         fail_reason = "invalid_request";
@@ -656,21 +657,6 @@ static int handle_scan(int fd, cJSON *json)
                 unseal_reason, req.tee_sealed_key_len);
         fail_reason = "unseal_failed";
         goto scan_failed;
-    }
-
-    {
-        char nonce_b64[48];
-        sodium_bin2base64(nonce_b64, sizeof(nonce_b64),
-                          req.meta_nonce, E2EE_NONCE_SIZE,
-                          sodium_base64_VARIANT_ORIGINAL);
-
-        if (tee_verify_metadata_mac(data_key,
-                req.meta_version, nonce_b64, req.meta_chunk_size,
-                req.meta_chunks, req.meta_plaintext_sha256,
-                req.meta_plaintext_size, req.meta_metadata_mac) != 0) {
-            fail_reason = "metadata_mac_invalid";
-            goto scan_failed;
-        }
     }
 
     reserve_bytes = (long long)req.meta_plaintext_size * TEE_SCAN_MEM_RESERVE_MULT;
@@ -689,7 +675,7 @@ static int handle_scan(int fd, cJSON *json)
             req.meta_version,
             av_stream ? av_stream_feed_trampoline : NULL,
             av_stream,
-            &plaintext, &plaintext_len);
+            derived_sha256, &plaintext, &plaintext_len);
     if (decrypt_rc != 0) {
         if (av_stream) {
             char av_sig[1] = {0};
@@ -697,6 +683,21 @@ static int handle_scan(int fd, cJSON *json)
         }
         fail_reason = "decryption_failed";
         goto scan_failed;
+    }
+
+    {
+        char nonce_b64[48];
+        sodium_bin2base64(nonce_b64, sizeof(nonce_b64),
+                          req.meta_nonce, E2EE_NONCE_SIZE,
+                          sodium_base64_VARIANT_ORIGINAL);
+
+        if (tee_verify_metadata_mac(data_key,
+                req.meta_version, nonce_b64, req.meta_chunk_size,
+                req.meta_chunks, derived_sha256,
+                req.meta_plaintext_size, req.meta_metadata_mac) != 0) {
+            fail_reason = "metadata_mac_invalid";
+            goto scan_failed;
+        }
     }
 
     char av_sig[128] = {0};
@@ -867,7 +868,7 @@ static int handle_scan(int fd, cJSON *json)
 
     audit_entry_t audit_entry = {
         .user_id = req.user_id,
-        .plaintext_sha256 = req.meta_plaintext_sha256,
+        .plaintext_sha256 = derived_sha256,
         .verdict = result.verdict,
         .reason = result.reason,
         .duration_ms = result.duration_ms,
@@ -896,7 +897,7 @@ scan_failed:
     if (reserved) {
         tee_admission_release(&g_inflight_bytes, reserve_bytes);
     }
-    audit_scan_failure(req.user_id, req.meta_plaintext_sha256,
+    audit_scan_failure(req.user_id, derived_sha256,
                        fail_reason, scan_elapsed_ms(&ts_start));
     atomic_fetch_sub(&g_inflight, 1);
     return send_error(fd, fail_reason);
