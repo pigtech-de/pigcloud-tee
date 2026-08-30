@@ -537,7 +537,8 @@ static int parse_scan_request(cJSON *json, scan_request_t *req)
 
     if (!cJSON_IsNumber(ver) || !cJSON_IsString(nonce) ||
         !cJSON_IsNumber(cs)  || !cJSON_IsNumber(ch) ||
-        !cJSON_IsString(sha) || !cJSON_IsNumber(psz) ||
+        (sha && !cJSON_IsNull(sha) && !cJSON_IsString(sha)) ||
+        !cJSON_IsNumber(psz) ||
         !cJSON_IsString(mac)) {
         return -1;
     }
@@ -574,7 +575,7 @@ static int parse_scan_request(cJSON *json, scan_request_t *req)
     if (req->meta_chunks < expected_chunks - 1 || req->meta_chunks > expected_chunks + 1) {
         return -1;
     }
-    if (!is_hex_str(sha->valuestring, SHA256_HEX_LEN) ||
+    if ((cJSON_IsString(sha) && !is_hex_str(sha->valuestring, SHA256_HEX_LEN)) ||
         !is_hex_str(mac->valuestring, SHA256_HEX_LEN)) {
         return -1;
     }
@@ -588,7 +589,9 @@ static int parse_scan_request(cJSON *json, scan_request_t *req)
         return -1;
     }
 
-    memcpy(req->meta_plaintext_sha256, sha->valuestring, SHA256_HEX_LEN);
+    if (cJSON_IsString(sha)) {
+        memcpy(req->meta_plaintext_sha256, sha->valuestring, SHA256_HEX_LEN);
+    }
     req->meta_plaintext_sha256[SHA256_HEX_LEN] = '\0';
     memcpy(req->meta_metadata_mac, mac->valuestring, SHA256_HEX_LEN);
     req->meta_metadata_mac[SHA256_HEX_LEN] = '\0';
@@ -824,7 +827,6 @@ static int handle_scan(int fd, cJSON *json)
         cJSON_AddStringToObject(meta, "nonce", nonce_b64);
         cJSON_AddNumberToObject(meta, "chunk_size", E2EE_CHUNK_SIZE);
         cJSON_AddNumberToObject(meta, "chunks", result.new_chunks);
-        cJSON_AddStringToObject(meta, "plaintext_sha256", result.new_plaintext_sha256);
         cJSON_AddNumberToObject(meta, "plaintext_size", (double)result.new_plaintext_size);
         cJSON_AddStringToObject(meta, "metadata_mac", result.new_metadata_mac);
         cJSON_AddBoolToObject(meta, "e2ee", 1);
