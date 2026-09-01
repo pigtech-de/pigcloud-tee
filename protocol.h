@@ -16,6 +16,8 @@
 
 #define TEE_MAX_PLAINTEXT_SIZE (5ULL * 1024 * 1024 * 1024)
 
+#define TEE_VERDICT_FILE_SUFFIX ".verdict"
+
 #define TEE_SCAN_WALL_CAP_SECS 540
 
 #define OP_SCAN          "scan"

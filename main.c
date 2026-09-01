@@ -629,6 +629,80 @@ static void audit_scan_failure(uint64_t user_id, const char *sha,
     audit_record(&e);
 }
 
+static int scan_request_is_async(cJSON *json)
+{
+    return cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(json, "async"));
+}
+
+static int write_verdict_file(const char *file_path, cJSON *resp)
+{
+    const char *basename = strrchr(file_path, '/');
+    basename = basename ? basename + 1 : file_path;
+    char final_path[4096 + 64];
+    char tmp_path[sizeof(final_path) + 8];
+    int n = snprintf(final_path, sizeof(final_path), "%s%s%s%s",
+                     QUARANTINE_PATH_PREFIX, QUARANTINE_SANITIZED_SUBDIR,
+                     basename, TEE_VERDICT_FILE_SUFFIX);
+    if (n < 0 || (size_t)n >= sizeof(final_path)) {
+        fprintf(stderr, "ERROR: verdict path too long for %s\n", basename);
+        return -1;
+    }
+    snprintf(tmp_path, sizeof(tmp_path), "%s.tmp", final_path);
+
+    char *str = cJSON_PrintUnformatted(resp);
+    if (!str) {
+        return -1;
+    }
+    int rc = -1;
+    int wfd = open(tmp_path, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0640);
+    if (wfd >= 0) {
+        size_t len = strlen(str);
+        size_t total = 0;
+        while (total < len) {
+            ssize_t wr = write(wfd, str + total, len - total);
+            if (wr <= 0) {
+                break;
+            }
+            total += (size_t)wr;
+        }
+        rc = (total == len && close(wfd) == 0) ? 0 : -1;
+        if (rc != 0) {
+            close(wfd);
+        }
+    }
+    cJSON_free(str);
+    if (rc == 0 && rename(tmp_path, final_path) != 0) {
+        rc = -1;
+    }
+    if (rc != 0) {
+        fprintf(stderr, "ERROR: verdict file write failed for %s: %s\n",
+                basename, strerror(errno));
+        unlink(tmp_path);
+    }
+    return rc;
+}
+
+static int deliver_scan_reply(int fd, int detached, const char *file_path, cJSON *resp)
+{
+    if (detached) {
+        return write_verdict_file(file_path, resp);
+    }
+    return send_message(fd, resp);
+}
+
+static int deliver_scan_error(int fd, int detached, const char *file_path, const char *reason)
+{
+    if (!detached) {
+        return send_error(fd, reason);
+    }
+    cJSON *resp = cJSON_CreateObject();
+    cJSON_AddStringToObject(resp, "verdict", VERDICT_ERROR);
+    cJSON_AddStringToObject(resp, "reason", reason);
+    int rc = write_verdict_file(file_path, resp);
+    cJSON_Delete(resp);
+    return rc;
+}
+
 static int handle_scan(int fd, cJSON *json)
 {
     struct timespec ts_start, ts_end;
@@ -644,6 +718,7 @@ static int handle_scan(int fd, cJSON *json)
     size_t sanitized_len = 0;
     long long reserve_bytes = 0;
     int reserved = 0;
+    int detached = 0;
     const char *fail_reason = NULL;
     char derived_sha256[SHA256_HEX_BUF] = {0};
 
@@ -670,6 +745,17 @@ static int handle_scan(int fd, cJSON *json)
         return send_busy(fd);
     }
     reserved = 1;
+
+    if (scan_request_is_async(json)) {
+        cJSON *ack = cJSON_CreateObject();
+        cJSON_AddBoolToObject(ack, "accepted", 1);
+        if (send_message(fd, ack) != 0) {
+            fprintf(stderr, "WARN: async scan ack lost; verdict still lands on disk\n");
+        }
+        cJSON_Delete(ack);
+        shutdown(fd, SHUT_RDWR);
+        detached = 1;
+    }
 
     clamav_stream_t *av_stream = clamav_stream_begin();
     int decrypt_rc = tee_decrypt_file_cb(
@@ -877,7 +963,7 @@ static int handle_scan(int fd, cJSON *json)
     };
     audit_record(&audit_entry);
 
-    int rc = send_message(fd, resp);
+    int rc = deliver_scan_reply(fd, detached, req.file_path, resp);
     cJSON_Delete(resp);
 
     atomic_fetch_add(&g_scans_completed, 1);
@@ -902,7 +988,7 @@ scan_failed:
     audit_scan_failure(req.user_id, derived_sha256,
                        fail_reason, scan_elapsed_ms(&ts_start));
     atomic_fetch_sub(&g_inflight, 1);
-    return send_error(fd, fail_reason);
+    return deliver_scan_error(fd, detached, req.file_path, fail_reason);
 }
 
 static void handle_connection(int client_fd)

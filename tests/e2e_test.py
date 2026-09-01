@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-import socket, struct, json, os, hashlib, base64, sys, hmac
+import socket, struct, json, os, hashlib, base64, sys, hmac, time
 from nacl.utils import random as nacl_random
 import nacl.bindings
 import oqs
@@ -271,12 +271,60 @@ def verify_tee_signatures(result, attest, sanitized_path):
 def cleanup_scan_artifacts(test_file, quarantine):
     paths = [test_file,
              os.path.join(quarantine, "sanitized",
-                          os.path.basename(test_file) + ".sanitized")]
+                          os.path.basename(test_file) + ".sanitized"),
+             os.path.join(quarantine, "sanitized",
+                          os.path.basename(test_file) + ".verdict")]
     for path in paths:
         try:
             os.unlink(path)
         except OSError:
             pass
+
+def run_async_scan(async_file, quarantine, sealed, nonce_b64, num_chunks,
+                   pt_sha, pt_size, mac, sync_verdict, attest):
+    problems = []
+    try:
+        ack = ipc_request({
+            "op": "scan",
+            "async": True,
+            "file_path": async_file,
+            "user_id": 1,
+            "tee_sealed_key": base64.b64encode(sealed).decode(),
+            "encryption_meta": {
+                "version": 2,
+                "nonce": nonce_b64,
+                "chunk_size": CHUNK_SIZE,
+                "chunks": num_chunks,
+                "plaintext_sha256": pt_sha,
+                "plaintext_size": pt_size,
+                "metadata_mac": mac
+            },
+            "original_filename": "test.jpg"
+        })
+        if ack.get("accepted") is not True:
+            problems.append("expected {accepted: true}, got " + json.dumps(ack))
+            return problems
+        verdict_path = os.path.join(quarantine, "sanitized",
+                                    os.path.basename(async_file) + ".verdict")
+        deadline = time.time() + 120
+        async_result = None
+        while time.time() < deadline:
+            if os.path.exists(verdict_path):
+                with open(verdict_path) as vf:
+                    async_result = json.load(vf)
+                break
+            time.sleep(0.2)
+        if async_result is None:
+            problems.append("no verdict file within 120s at " + verdict_path)
+        elif async_result.get("verdict") != sync_verdict:
+            problems.append("async verdict {} differs from sync {}".format(
+                async_result.get("verdict"), sync_verdict))
+        elif async_result.get("verdict") == "sanitized":
+            problems.extend(verify_tee_signatures(
+                async_result, attest, async_result.get("sanitized_path", "")))
+    finally:
+        cleanup_scan_artifacts(async_file, quarantine)
+    return problems
 
 def main():
     self_check_only = "--self-check" in sys.argv
@@ -356,11 +404,24 @@ def main():
     finally:
         cleanup_scan_artifacts(test_file, test_dir)
 
+    print("8. Async scan: ack after admission, verdict via file...")
+    async_file = os.path.join(test_dir, "tee_e2e_" + os.urandom(8).hex())
+    with open(async_file, "wb") as f:
+        f.write(ciphertext)
+    async_problems = run_async_scan(async_file, test_dir, sealed, nonce_b64,
+                                    num_chunks, pt_sha, len(plaintext), mac,
+                                    result.get("verdict"), attest)
+    if not async_problems:
+        print("   async verdict matches the synchronous one")
+
     print("\n=== RESULT ===")
     print(json.dumps(result, indent=2))
 
     v = result.get("verdict", "")
     m = result.get("detected_mime", "")
+    if async_problems:
+        print("\nFAIL: async scan:\n     - " + "\n     - ".join(async_problems))
+        return 1
     if sig_problems:
         print("\nFAIL: enclave signature check failed:\n     - "
               + "\n     - ".join(sig_problems))
