@@ -391,9 +391,19 @@ static int scanner_unseal_via_signer(const unsigned char *sealed, size_t sealed_
     return rc;
 }
 
+static void copy_b64_field(cJSON *resp, const char *name, char *out, size_t out_size)
+{
+    out[0] = '\0';
+    cJSON *field = cJSON_GetObjectItemCaseSensitive(resp, name);
+    if (cJSON_IsString(field) && strlen(field->valuestring) < out_size) {
+        memcpy(out, field->valuestring, strlen(field->valuestring) + 1);
+    }
+}
+
 static int scanner_sign_output_via_signer(tee_output_digest_t digest,
                                           unsigned char sig_ed_out[E2EE_ED25519_SIG_SIZE],
-                                          unsigned char sig_ml_out[MLDSA44_SIGNATURE_SIZE])
+                                          unsigned char sig_ml_out[MLDSA44_SIGNATURE_SIZE],
+                                          scan_result_t *result)
 {
     if (!digest.produced) {
         return -1;
@@ -423,6 +433,10 @@ static int scanner_sign_output_via_signer(tee_output_digest_t digest,
                               NULL, &mln, NULL, sodium_base64_VARIANT_ORIGINAL) == 0 &&
             mln == MLDSA44_SIGNATURE_SIZE) {
             rc = 0;
+            copy_b64_field(resp, "pk_ed25519", result->tee_signing_pk_ed25519_b64,
+                           sizeof(result->tee_signing_pk_ed25519_b64));
+            copy_b64_field(resp, "pk_mldsa", result->tee_signing_pk_mldsa_b64,
+                           sizeof(result->tee_signing_pk_mldsa_b64));
         }
     }
     cJSON_Delete(resp);
@@ -868,7 +882,8 @@ static int handle_scan(int fd, cJSON *json)
 
         if (scanner_sign_output_via_signer(ct_digest,
                                            result.tee_signature_ed25519,
-                                           result.tee_signature_mldsa) != 0) {
+                                           result.tee_signature_mldsa,
+                                           &result) != 0) {
             fail_reason = "tee_sign_failed";
             goto scan_failed;
         }
@@ -932,6 +947,13 @@ static int handle_scan(int fd, cJSON *json)
                           result.tee_signature_mldsa, MLDSA44_SIGNATURE_SIZE,
                           sodium_base64_VARIANT_ORIGINAL);
         cJSON_AddStringToObject(resp, "tee_signature_mldsa", ml_b64);
+        if (result.tee_signing_pk_ed25519_b64[0] != '\0' &&
+            result.tee_signing_pk_mldsa_b64[0] != '\0') {
+            cJSON_AddStringToObject(resp, "enclave_signing_pk_ed25519",
+                                    result.tee_signing_pk_ed25519_b64);
+            cJSON_AddStringToObject(resp, "enclave_signing_pk_mldsa",
+                                    result.tee_signing_pk_mldsa_b64);
+        }
     }
 
     if (strcmp(result.verdict, VERDICT_CLEAN) == 0) {
@@ -1182,9 +1204,22 @@ static int handle_signer_sign(int fd, cJSON *json)
                       sig_ml, MLDSA44_SIGNATURE_SIZE,
                       sodium_base64_VARIANT_ORIGINAL);
 
+    char pk_ed_b64[sodium_base64_ENCODED_LEN(E2EE_ED25519_PK_SIZE,
+                                             sodium_base64_VARIANT_ORIGINAL)];
+    sodium_bin2base64(pk_ed_b64, sizeof(pk_ed_b64),
+                      attestation_get_ed25519_public_key(), E2EE_ED25519_PK_SIZE,
+                      sodium_base64_VARIANT_ORIGINAL);
+    char pk_ml_b64[sodium_base64_ENCODED_LEN(MLDSA44_PUBLIC_KEY_SIZE,
+                                             sodium_base64_VARIANT_ORIGINAL)];
+    sodium_bin2base64(pk_ml_b64, sizeof(pk_ml_b64),
+                      attestation_get_mldsa_public_key(), MLDSA44_PUBLIC_KEY_SIZE,
+                      sodium_base64_VARIANT_ORIGINAL);
+
     cJSON *resp = cJSON_CreateObject();
     cJSON_AddStringToObject(resp, "ed25519", ed_b64);
     cJSON_AddStringToObject(resp, "mldsa", ml_b64);
+    cJSON_AddStringToObject(resp, "pk_ed25519", pk_ed_b64);
+    cJSON_AddStringToObject(resp, "pk_mldsa", pk_ml_b64);
     int rc = send_message(fd, resp);
     cJSON_Delete(resp);
     return rc;

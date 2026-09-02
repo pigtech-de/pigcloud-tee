@@ -100,6 +100,8 @@ typedef struct {
     int has_tee_signature;
     unsigned char tee_signature_ed25519[E2EE_ED25519_SIG_SIZE];
     unsigned char tee_signature_mldsa[MLDSA44_SIGNATURE_SIZE];
+    char tee_signing_pk_ed25519_b64[64];
+    char tee_signing_pk_mldsa_b64[1760];
     int av_unavailable;
     int yara_unavailable;
     uint64_t duration_ms;

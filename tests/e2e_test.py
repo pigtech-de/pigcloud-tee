@@ -401,6 +401,10 @@ def main():
                 result, attest, result.get("sanitized_path", ""))
             if not sig_problems:
                 print("   ed25519 + ml-dsa verify against the attested signing PKs")
+            for key in ("enclave_signing_pk_ed25519", "enclave_signing_pk_mldsa"):
+                if result.get(key) != attest.get(key):
+                    sig_problems.append(
+                        "scan reply {} differs from the attestation's (or is missing)".format(key))
     finally:
         cleanup_scan_artifacts(test_file, test_dir)
 
