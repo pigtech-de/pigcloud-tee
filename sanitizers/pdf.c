@@ -61,11 +61,8 @@ int sanitize_pdf(
     }
 
     struct timespec scan_deadline;
-    clock_gettime(CLOCK_MONOTONIC, &scan_deadline);
-    scan_deadline.tv_sec += TEE_SCAN_CONVERTER_BUDGET_SECS;
-
-    int timeout_secs = tee_secs_until(&scan_deadline);
-    if (timeout_secs > TEE_SUBPROC_WALL_CAP_SECS) timeout_secs = TEE_SUBPROC_WALL_CAP_SECS;
+    tee_deadline_start(&scan_deadline, TEE_SCAN_CONVERTER_BUDGET_SECS);
+    int timeout_secs = tee_secs_within(&scan_deadline, TEE_SUBPROC_WALL_CAP_SECS);
 
     char *const gs_args[] = {
         (char *)gs,
@@ -98,16 +95,9 @@ int sanitize_pdf(
         return SANITIZE_ERROR;
     }
 
-    *out = tee_read_memfd(out_fd, out_len, TEE_SUBPROC_MAX_OUTPUT_BYTES);
-    close(out_fd);
-
-    if (!*out || *out_len == 0) {
-        free(*out);
-        *out = NULL;
-        *out_len = 0;
-        snprintf(reason, reason_size, "ghostscript_empty_output");
+    if (tee_memfd_finish_output(out_fd, out, out_len, TEE_SUBPROC_MAX_OUTPUT_BYTES,
+                                "ghostscript_empty_output", reason, reason_size) != 0) {
         return SANITIZE_ERROR;
     }
-
     return SANITIZE_MODIFIED;
 }

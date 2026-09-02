@@ -102,8 +102,7 @@ int sanitize_audio(
     char *out_path = io.out_path;
 
     struct timespec scan_deadline;
-    clock_gettime(CLOCK_MONOTONIC, &scan_deadline);
-    scan_deadline.tv_sec += TEE_SCAN_CONVERTER_BUDGET_SECS;
+    tee_deadline_start(&scan_deadline, TEE_SCAN_CONVERTER_BUDGET_SECS);
     int timed_out = 0;
 
     char *const remux_args[] = {
@@ -115,9 +114,8 @@ int sanitize_audio(
         out_path, NULL
     };
 
-    int remux_to = tee_secs_until(&scan_deadline);
-    if (remux_to > TEE_SUBPROC_WALL_CAP_SECS) remux_to = TEE_SUBPROC_WALL_CAP_SECS;
-    int rc = tee_spawn_converter(ffmpeg, remux_args, remux_to, (const int[]){in_fd, out_fd}, 2);
+    int rc = tee_spawn_converter(ffmpeg, remux_args, tee_secs_within(&scan_deadline, TEE_SUBPROC_WALL_CAP_SECS),
+                                 (const int[]){in_fd, out_fd}, 2);
     if (rc == TEE_SUBPROC_TIMEOUT) timed_out = 1;
 
     if (rc != 0) {
@@ -140,10 +138,8 @@ int sanitize_audio(
                     renc_path, NULL
                 };
 
-                int reencode_to = tee_secs_until(&scan_deadline);
-                if (reencode_to > TEE_SUBPROC_WALL_CAP_SECS) reencode_to = TEE_SUBPROC_WALL_CAP_SECS;
-
-                rc = tee_spawn_converter(ffmpeg, reencode_args, reencode_to, (const int[]){in_fd, renc_fd}, 2);
+                rc = tee_spawn_converter(ffmpeg, reencode_args, tee_secs_within(&scan_deadline, TEE_SUBPROC_WALL_CAP_SECS),
+                                         (const int[]){in_fd, renc_fd}, 2);
                 if (rc == TEE_SUBPROC_TIMEOUT) timed_out = 1;
                 if (rc != 0) {
                     close(renc_fd);
@@ -169,10 +165,8 @@ int sanitize_audio(
                         lenient_path, NULL
                     };
 
-                    int lenient_to = tee_secs_until(&scan_deadline);
-                    if (lenient_to > TEE_SUBPROC_WALL_CAP_SECS) lenient_to = TEE_SUBPROC_WALL_CAP_SECS;
-
-                    rc = tee_spawn_converter(ffmpeg, lenient_args, lenient_to, (const int[]){in_fd, lenient_fd}, 2);
+                    rc = tee_spawn_converter(ffmpeg, lenient_args, tee_secs_within(&scan_deadline, TEE_SUBPROC_WALL_CAP_SECS),
+                                             (const int[]){in_fd, lenient_fd}, 2);
                     if (rc == TEE_SUBPROC_TIMEOUT) timed_out = 1;
                     if (rc == 0) {
                         renc_fd = lenient_fd;
@@ -198,17 +192,9 @@ int sanitize_audio(
     }
 
     close(in_fd);
-
-    *out = tee_read_memfd(out_fd, out_len, TEE_SUBPROC_MAX_OUTPUT_BYTES);
-    close(out_fd);
-
-    if (!*out || *out_len == 0) {
-        free(*out);
-        *out = NULL;
-        *out_len = 0;
-        snprintf(reason, reason_size, "ffmpeg_empty_output");
+    if (tee_memfd_finish_output(out_fd, out, out_len, TEE_SUBPROC_MAX_OUTPUT_BYTES,
+                                "ffmpeg_empty_output", reason, reason_size) != 0) {
         return SANITIZE_ERROR;
     }
-
     return SANITIZE_MODIFIED;
 }

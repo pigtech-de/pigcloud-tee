@@ -1013,22 +1013,30 @@ scan_failed:
     return deliver_scan_error(fd, detached, req.file_path, fail_reason);
 }
 
-static void handle_connection(int client_fd)
+static cJSON *recv_op_message(int client_fd, const char **op_out)
 {
     cJSON *msg = recv_message(client_fd);
     if (!msg) {
         send_error(client_fd, "invalid_message");
-        return;
+        return NULL;
     }
-
     cJSON *op = cJSON_GetObjectItemCaseSensitive(msg, "op");
     if (!cJSON_IsString(op)) {
         send_error(client_fd, "missing_op");
         cJSON_Delete(msg);
+        return NULL;
+    }
+    *op_out = op->valuestring;
+    return msg;
+}
+
+static void handle_connection(int client_fd)
+{
+    const char *op_str = NULL;
+    cJSON *msg = recv_op_message(client_fd, &op_str);
+    if (!msg) {
         return;
     }
-
-    const char *op_str = op->valuestring;
 
     if (strcmp(op_str, OP_SCAN) == 0) {
         handle_scan(client_fd, msg);
@@ -1227,18 +1235,11 @@ static int handle_signer_sign(int fd, cJSON *json)
 
 static void handle_signer_connection(int client_fd)
 {
-    cJSON *msg = recv_message(client_fd);
+    const char *op_str = NULL;
+    cJSON *msg = recv_op_message(client_fd, &op_str);
     if (!msg) {
-        send_error(client_fd, "invalid_message");
         return;
     }
-    cJSON *op = cJSON_GetObjectItemCaseSensitive(msg, "op");
-    if (!cJSON_IsString(op)) {
-        send_error(client_fd, "missing_op");
-        cJSON_Delete(msg);
-        return;
-    }
-    const char *op_str = op->valuestring;
     if (strcmp(op_str, OP_UNSEAL) == 0) {
         handle_signer_unseal(client_fd, msg);
     } else if (strcmp(op_str, OP_SIGN) == 0) {
@@ -1319,6 +1320,51 @@ static int tee_listen_unix(const char *socket_path, int *activated_out)
     return server_fd;
 }
 
+static int tee_accept_gated(int server_fd, struct pollfd *pfd, const char *role)
+{
+#ifdef HAVE_SYSTEMD
+    sd_notify(0, "WATCHDOG=1");
+#endif
+    int pret = poll(pfd, 1, 10000);
+    if (pret < 0) {
+        if (errno != EINTR) {
+            perror("poll");
+        }
+        return -1;
+    }
+    if (pret == 0) {
+        return -1;
+    }
+
+    int client_fd = accept4(server_fd, NULL, NULL, SOCK_CLOEXEC);
+    if (client_fd < 0) {
+        if (errno != EINTR) {
+            perror("accept");
+        }
+        return -1;
+    }
+
+    struct ucred peer_cred = {0};
+    socklen_t cred_len = sizeof(peer_cred);
+    int cred_ok = (getsockopt(client_fd, SOL_SOCKET, SO_PEERCRED,
+                              &peer_cred, &cred_len) == 0 &&
+                   cred_len == sizeof(peer_cred));
+    int peer_allowed = cred_ok && g_expected_peer_uid != (uid_t)-1 &&
+                       (peer_cred.uid == g_expected_peer_uid ||
+                        peer_cred.uid == 0);
+    if (!peer_allowed) {
+        fprintf(stderr, "WARN: %srefused connection from uid=%d pid=%d\n",
+                role, (int)peer_cred.uid, (int)peer_cred.pid);
+        close(client_fd);
+        return -1;
+    }
+
+    struct timeval tv = { .tv_sec = 120, .tv_usec = 0 };
+    setsockopt(client_fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    setsockopt(client_fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+    return client_fd;
+}
+
 static int tee_start_workers(pthread_t *workers, void *(*loop)(void *),
                              const char *role)
 {
@@ -1384,48 +1430,10 @@ static int run_signer(const char *socket_path)
     pfd.fd = server_fd;
     pfd.events = POLLIN;
     while (g_running) {
-#ifdef HAVE_SYSTEMD
-        sd_notify(0, "WATCHDOG=1");
-#endif
-        int pret = poll(&pfd, 1, 10000);
-        if (pret < 0) {
-            if (errno == EINTR) {
-                continue;
-            }
-            perror("poll");
-            continue;
-        }
-        if (pret == 0) {
-            continue;
-        }
-
-        int client_fd = accept4(server_fd, NULL, NULL, SOCK_CLOEXEC);
+        int client_fd = tee_accept_gated(server_fd, &pfd, "signer ");
         if (client_fd < 0) {
-            if (errno == EINTR) {
-                continue;
-            }
-            perror("accept");
             continue;
         }
-
-        struct ucred peer_cred = {0};
-        socklen_t cred_len = sizeof(peer_cred);
-        int cred_ok = (getsockopt(client_fd, SOL_SOCKET, SO_PEERCRED,
-                                  &peer_cred, &cred_len) == 0 &&
-                       cred_len == sizeof(peer_cred));
-        int peer_allowed = cred_ok && g_expected_peer_uid != (uid_t)-1 &&
-                           (peer_cred.uid == g_expected_peer_uid ||
-                            peer_cred.uid == 0);
-        if (!peer_allowed) {
-            fprintf(stderr, "WARN: signer refused connection from uid=%d pid=%d\n",
-                    (int)peer_cred.uid, (int)peer_cred.pid);
-            close(client_fd);
-            continue;
-        }
-
-        struct timeval tv = { .tv_sec = 120, .tv_usec = 0 };
-        setsockopt(client_fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-        setsockopt(client_fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
         tee_queue_push(&g_queue, client_fd);
     }
 
@@ -1604,43 +1612,8 @@ int main(int argc, char *argv[])
     pfd.events = POLLIN;
 
     while (g_running) {
-#ifdef HAVE_SYSTEMD
-        sd_notify(0, "WATCHDOG=1");
-#endif
-
-        int pret = poll(&pfd, 1, 10000);
-        if (pret < 0) {
-            if (errno == EINTR) {
-                continue;
-            }
-            perror("poll");
-            continue;
-        }
-        if (pret == 0) {
-            continue;
-        }
-
-        int client_fd = accept4(server_fd, NULL, NULL, SOCK_CLOEXEC);
+        int client_fd = tee_accept_gated(server_fd, &pfd, "");
         if (client_fd < 0) {
-            if (errno == EINTR) {
-                continue;
-            }
-            perror("accept");
-            continue;
-        }
-
-        struct ucred peer_cred = {0};
-        socklen_t cred_len = sizeof(peer_cred);
-        int cred_ok = (getsockopt(client_fd, SOL_SOCKET, SO_PEERCRED,
-                                  &peer_cred, &cred_len) == 0 &&
-                       cred_len == sizeof(peer_cred));
-        int peer_allowed = cred_ok && g_expected_peer_uid != (uid_t)-1 &&
-                           (peer_cred.uid == g_expected_peer_uid ||
-                            peer_cred.uid == 0);
-        if (!peer_allowed) {
-            fprintf(stderr, "WARN: refused connection from uid=%d pid=%d\n",
-                    (int)peer_cred.uid, (int)peer_cred.pid);
-            close(client_fd);
             continue;
         }
 
@@ -1648,10 +1621,6 @@ int main(int argc, char *argv[])
             close(client_fd);
             continue;
         }
-
-        struct timeval tv = { .tv_sec = 120, .tv_usec = 0 };
-        setsockopt(client_fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-        setsockopt(client_fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
 
         if (tee_queue_try_push(&g_queue, client_fd) != 0) {
             struct timeval bt = { .tv_sec = 2, .tv_usec = 0 };

@@ -544,6 +544,27 @@ static int build_metadata_canonical(
     return n;
 }
 
+static int metadata_mac(
+    const unsigned char data_key[E2EE_KEY_SIZE],
+    int version, const char *nonce_b64, int chunk_size, int chunks,
+    const char *plaintext_sha256, int64_t plaintext_size,
+    unsigned char mac[crypto_auth_hmacsha256_BYTES])
+{
+    char canonical[1024];
+    int clen = build_metadata_canonical(
+        version, nonce_b64, chunk_size, chunks,
+        plaintext_sha256, plaintext_size,
+        canonical, sizeof(canonical));
+    if (clen < 0) {
+        return -1;
+    }
+    crypto_auth_hmacsha256_state state;
+    crypto_auth_hmacsha256_init(&state, data_key, E2EE_KEY_SIZE);
+    crypto_auth_hmacsha256_update(&state, (const unsigned char *)canonical, (unsigned long long)clen);
+    crypto_auth_hmacsha256_final(&state, mac);
+    return 0;
+}
+
 int tee_verify_metadata_mac(
     const unsigned char data_key[E2EE_KEY_SIZE],
     int version, const char *nonce_b64, int chunk_size, int chunks,
@@ -554,20 +575,11 @@ int tee_verify_metadata_mac(
         return -1;
     }
 
-    char canonical[1024];
-    int clen = build_metadata_canonical(
-        version, nonce_b64, chunk_size, chunks,
-        plaintext_sha256, plaintext_size,
-        canonical, sizeof(canonical));
-    if (clen < 0) {
+    unsigned char mac[crypto_auth_hmacsha256_BYTES];
+    if (metadata_mac(data_key, version, nonce_b64, chunk_size, chunks,
+                     plaintext_sha256, plaintext_size, mac) != 0) {
         return -1;
     }
-
-    unsigned char mac[crypto_auth_hmacsha256_BYTES];
-    crypto_auth_hmacsha256_state state;
-    crypto_auth_hmacsha256_init(&state, data_key, E2EE_KEY_SIZE);
-    crypto_auth_hmacsha256_update(&state, (const unsigned char *)canonical, (unsigned long long)clen);
-    crypto_auth_hmacsha256_final(&state, mac);
 
     unsigned char expected_bin[crypto_auth_hmacsha256_BYTES];
     if (sodium_hex2bin(expected_bin, sizeof(expected_bin),
@@ -587,20 +599,11 @@ int tee_compute_metadata_mac(
     const char *plaintext_sha256, int64_t plaintext_size,
     char mac_hex_out[SHA256_HEX_BUF])
 {
-    char canonical[1024];
-    int clen = build_metadata_canonical(
-        version, nonce_b64, chunk_size, chunks,
-        plaintext_sha256, plaintext_size,
-        canonical, sizeof(canonical));
-    if (clen < 0) {
+    unsigned char mac[crypto_auth_hmacsha256_BYTES];
+    if (metadata_mac(data_key, version, nonce_b64, chunk_size, chunks,
+                     plaintext_sha256, plaintext_size, mac) != 0) {
         return -1;
     }
-
-    unsigned char mac[crypto_auth_hmacsha256_BYTES];
-    crypto_auth_hmacsha256_state state;
-    crypto_auth_hmacsha256_init(&state, data_key, E2EE_KEY_SIZE);
-    crypto_auth_hmacsha256_update(&state, (const unsigned char *)canonical, (unsigned long long)clen);
-    crypto_auth_hmacsha256_final(&state, mac);
 
     hex_encode(mac, sizeof(mac), mac_hex_out);
     return 0;

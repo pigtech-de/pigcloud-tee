@@ -77,6 +77,18 @@ static inline int tee_secs_until(const struct timespec *deadline)
     return secs > 0 ? (int)secs : 0;
 }
 
+static inline void tee_deadline_start(struct timespec *deadline, int budget_secs)
+{
+    clock_gettime(CLOCK_MONOTONIC, deadline);
+    deadline->tv_sec += budget_secs;
+}
+
+static inline int tee_secs_within(const struct timespec *deadline, int per_attempt_cap)
+{
+    int secs = tee_secs_until(deadline);
+    return secs > per_attempt_cap ? per_attempt_cap : secs;
+}
+
 static inline int tee_wait_child(pid_t pid, int timeout_secs, int *status_out)
 {
     struct timespec deadline;
@@ -137,6 +149,22 @@ static inline unsigned char *tee_read_memfd(int fd, size_t *out_len, size_t max_
 
     *out_len = total;
     return buf;
+}
+
+static inline int tee_memfd_finish_output(int out_fd, unsigned char **out, size_t *out_len,
+                                          size_t max_len, const char *empty_reason,
+                                          char *reason, size_t reason_size)
+{
+    *out = tee_read_memfd(out_fd, out_len, max_len);
+    close(out_fd);
+    if (!*out || *out_len == 0) {
+        free(*out);
+        *out = NULL;
+        *out_len = 0;
+        snprintf(reason, reason_size, "%s", empty_reason);
+        return -1;
+    }
+    return 0;
 }
 
 static inline int tee_memfd_write(int fd, const unsigned char *data, size_t len)
