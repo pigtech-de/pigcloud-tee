@@ -55,6 +55,13 @@ int tee_decrypt_file(
     size_t *plaintext_len
 );
 
+int tee_seal_hybrid(
+    const unsigned char *payload, size_t payload_len,
+    const unsigned char recipient_x25519_pk[32],
+    const unsigned char *recipient_kyber_pk,
+    unsigned char *sealed_out, size_t sealed_out_cap, size_t *sealed_len_out
+);
+
 int tee_decrypt_file_cb(
     const char *ciphertext_path,
     const unsigned char data_key[E2EE_KEY_SIZE],

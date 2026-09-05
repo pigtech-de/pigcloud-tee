@@ -306,6 +306,49 @@ int main(int argc, char **argv)
               && reason != NULL && strcmp(reason, TEE_UNSEAL_REASON_BLOB_TOO_SHORT) == 0,
           "truncated blob names the length guard, not the AEAD failure");
 
+    {
+        size_t rx_len = 0, rk_len = 0;
+        unsigned char *recipient_x25519_pk = b64_field(recipient, "x25519_pk_b64", &rx_len);
+        unsigned char *recipient_kyber_pk = b64_field(recipient, "mlkem_pk_b64", &rk_len);
+        check(recipient_x25519_pk && rx_len == 32, "fixture carries the recipient X25519 PK");
+        check(recipient_kyber_pk && rk_len == KYBER_PUBLIC_KEY_SIZE, "fixture carries the recipient ML-KEM PK");
+
+        unsigned char digest[E2EE_KEY_SIZE];
+        for (size_t i = 0; i < sizeof(digest); i++) {
+            digest[i] = (unsigned char)(0xA0 ^ i);
+        }
+        unsigned char produced[HYBRID_HEADER_SIZE + E2EE_KEY_SIZE + E2EE_TAG_SIZE];
+        size_t produced_len = 0;
+        int seal_rc = -1;
+        if (recipient_x25519_pk && recipient_kyber_pk && rx_len == 32) {
+            seal_rc = tee_seal_hybrid(digest, sizeof(digest),
+                                      recipient_x25519_pk, recipient_kyber_pk,
+                                      produced, sizeof(produced), &produced_len);
+        }
+        check(seal_rc == 0, "tee_seal_hybrid produces a blob");
+        check(seal_rc == 0 && produced_len == sizeof(produced),
+              "the sealed blob is header + payload + tag, the layout every impl unseals");
+
+        unsigned char reopened[E2EE_KEY_SIZE];
+        const char *seal_reason = NULL;
+        check(seal_rc == 0 && tee_unseal_hybrid_data_key(produced, produced_len,
+                                                         x25519_sk, kyber_seed,
+                                                         reopened, &seal_reason) == 0,
+              "the fixture's recipient keys open what the enclave sealed");
+        check(seal_rc == 0 && memcmp(reopened, digest, sizeof(digest)) == 0,
+              "the payload survives the seal round trip");
+
+        produced[0] ^= 0x01;
+        seal_reason = NULL;
+        check(seal_rc == 0 && tee_unseal_hybrid_data_key(produced, produced_len,
+                                                         x25519_sk, kyber_seed,
+                                                         reopened, &seal_reason) != 0,
+              "a tampered enclave-sealed blob is rejected too");
+
+        free(recipient_x25519_pk);
+        free(recipient_kyber_pk);
+    }
+
     unlink(ct_path);
     free(x25519_sk);
     free(kyber_seed);

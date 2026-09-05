@@ -215,6 +215,92 @@ int tee_unseal_hybrid_data_key(
     return 0;
 }
 
+int tee_seal_hybrid(
+    const unsigned char *payload, size_t payload_len,
+    const unsigned char recipient_x25519_pk[32],
+    const unsigned char *recipient_kyber_pk,
+    unsigned char *sealed_out, size_t sealed_out_cap, size_t *sealed_len_out)
+{
+    if (!payload || !sealed_out || !sealed_len_out) {
+        return -1;
+    }
+    const size_t need = HYBRID_HEADER_SIZE + payload_len + E2EE_TAG_SIZE;
+    if (sealed_out_cap < need) {
+        return -1;
+    }
+
+    unsigned char eph_pk[32];
+    unsigned char eph_sk[32];
+    crypto_box_keypair(eph_pk, eph_sk);
+
+    unsigned char ss_x[crypto_scalarmult_BYTES];
+    if (crypto_scalarmult(ss_x, eph_sk, recipient_x25519_pk) != 0) {
+        sodium_memzero(eph_sk, sizeof(eph_sk));
+        return -1;
+    }
+    sodium_memzero(eph_sk, sizeof(eph_sk));
+
+    OQS_KEM *kem = OQS_KEM_new(OQS_KEM_alg_ml_kem_768);
+    if (!kem) {
+        sodium_memzero(ss_x, sizeof(ss_x));
+        return -1;
+    }
+    if (kem->length_public_key != KYBER_PUBLIC_KEY_SIZE
+        || kem->length_ciphertext != KYBER_CIPHERTEXT_SIZE
+        || kem->length_shared_secret != KYBER_SHARED_SECRET_SIZE) {
+        OQS_KEM_free(kem);
+        sodium_memzero(ss_x, sizeof(ss_x));
+        return -1;
+    }
+
+    unsigned char mlkem_ct[KYBER_CIPHERTEXT_SIZE];
+    unsigned char ss_k[KYBER_SHARED_SECRET_SIZE];
+    if (OQS_KEM_encaps(kem, mlkem_ct, ss_k, recipient_kyber_pk) != OQS_SUCCESS) {
+        OQS_KEM_free(kem);
+        sodium_memzero(ss_x, sizeof(ss_x));
+        sodium_memzero(ss_k, sizeof(ss_k));
+        return -1;
+    }
+    OQS_KEM_free(kem);
+
+    unsigned char wrap_key[E2EE_KEY_SIZE];
+    const char *reason = NULL;
+    int rc = derive_hybrid_wrap_key(
+        mlkem_ct, KYBER_CIPHERTEXT_SIZE,
+        eph_pk, sizeof(eph_pk),
+        recipient_x25519_pk, 32,
+        ss_x, sizeof(ss_x),
+        ss_k, sizeof(ss_k),
+        wrap_key, &reason);
+    sodium_memzero(ss_x, sizeof(ss_x));
+    sodium_memzero(ss_k, sizeof(ss_k));
+    if (rc != 0) {
+        sodium_memzero(wrap_key, sizeof(wrap_key));
+        return -1;
+    }
+
+    unsigned char aead_nonce[E2EE_NONCE_SIZE];
+    randombytes_buf(aead_nonce, sizeof(aead_nonce));
+
+    memcpy(sealed_out, eph_pk, sizeof(eph_pk));
+    memcpy(sealed_out + 32, mlkem_ct, KYBER_CIPHERTEXT_SIZE);
+    memcpy(sealed_out + 32 + KYBER_CIPHERTEXT_SIZE, aead_nonce, sizeof(aead_nonce));
+
+    unsigned long long ct_len = 0;
+    int aead_rc = crypto_aead_xchacha20poly1305_ietf_encrypt(
+        sealed_out + HYBRID_HEADER_SIZE, &ct_len,
+        payload, payload_len,
+        NULL, 0, NULL,
+        aead_nonce, wrap_key);
+    sodium_memzero(wrap_key, sizeof(wrap_key));
+    if (aead_rc != 0 || ct_len != payload_len + E2EE_TAG_SIZE) {
+        sodium_memzero(sealed_out, need);
+        return -1;
+    }
+    *sealed_len_out = HYBRID_HEADER_SIZE + (size_t)ct_len;
+    return 0;
+}
+
 int tee_sign_hash(
     const unsigned char hash[32],
     const unsigned char *enclave_ed25519_sk,

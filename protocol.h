@@ -45,6 +45,7 @@
 #define E2EE_LEN_PREFIX_SIZE  4
 #define E2EE_METADATA_VERSION 2
 
+#define SHA256_DIGEST_SIZE 32
 #define SHA256_HEX_LEN 64
 #define SHA256_HEX_BUF (SHA256_HEX_LEN + 1)
 
@@ -84,6 +85,9 @@ typedef struct {
     int64_t meta_plaintext_size;
     char meta_metadata_mac[SHA256_HEX_BUF];
     char original_filename[256];
+    int has_owner_pk;
+    unsigned char owner_x25519_pk[32];
+    unsigned char owner_kyber_pk[KYBER_PUBLIC_KEY_SIZE];
 } scan_request_t;
 
 typedef struct {
@@ -102,6 +106,9 @@ typedef struct {
     unsigned char tee_signature_mldsa[MLDSA44_SIGNATURE_SIZE];
     char tee_signing_pk_ed25519_b64[64];
     char tee_signing_pk_mldsa_b64[1760];
+    int has_sealed_content_hash;
+    unsigned char sealed_content_hash[HYBRID_HEADER_SIZE + SHA256_DIGEST_SIZE + E2EE_TAG_SIZE];
+    size_t sealed_content_hash_len;
     int av_unavailable;
     int yara_unavailable;
     uint64_t duration_ms;

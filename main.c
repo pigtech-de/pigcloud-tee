@@ -610,6 +610,24 @@ static int parse_scan_request(cJSON *json, scan_request_t *req)
     memcpy(req->meta_metadata_mac, mac->valuestring, SHA256_HEX_LEN);
     req->meta_metadata_mac[SHA256_HEX_LEN] = '\0';
 
+    cJSON *owner_x = cJSON_GetObjectItemCaseSensitive(json, "owner_public_key");
+    cJSON *owner_k = cJSON_GetObjectItemCaseSensitive(json, "owner_public_key_kyber");
+    if (cJSON_IsString(owner_x) && cJSON_IsString(owner_k)) {
+        size_t x_len = 0, k_len = 0;
+        if (sodium_base642bin(req->owner_x25519_pk, sizeof(req->owner_x25519_pk),
+                              owner_x->valuestring, strlen(owner_x->valuestring),
+                              NULL, &x_len, NULL, sodium_base64_VARIANT_ORIGINAL) == 0
+            && x_len == sizeof(req->owner_x25519_pk)
+            && sodium_base642bin(req->owner_kyber_pk, sizeof(req->owner_kyber_pk),
+                                 owner_k->valuestring, strlen(owner_k->valuestring),
+                                 NULL, &k_len, NULL, sodium_base64_VARIANT_ORIGINAL) == 0
+            && k_len == sizeof(req->owner_kyber_pk)) {
+            req->has_owner_pk = 1;
+        } else {
+            return -1;
+        }
+    }
+
     if (cJSON_IsString(filename)) {
         size_t fn_len = strlen(filename->valuestring);
         if (fn_len >= sizeof(req->original_filename)) {
@@ -875,6 +893,20 @@ static int handle_scan(int fd, cJSON *json)
         result.new_plaintext_size = (int64_t)sanitized_len;
         snprintf(result.sanitized_path, sizeof(result.sanitized_path), "%s", sanitized_path);
 
+        if (req.has_owner_pk) {
+            unsigned char digest[SHA256_DIGEST_SIZE];
+            if (sodium_hex2bin(digest, sizeof(digest), new_sha256, SHA256_HEX_LEN,
+                               NULL, NULL, NULL) == 0
+                && tee_seal_hybrid(digest, sizeof(digest),
+                                   req.owner_x25519_pk, req.owner_kyber_pk,
+                                   result.sealed_content_hash,
+                                   sizeof(result.sealed_content_hash),
+                                   &result.sealed_content_hash_len) == 0) {
+                result.has_sealed_content_hash = 1;
+            }
+            sodium_memzero(digest, sizeof(digest));
+        }
+
         tee_compute_metadata_mac(data_key,
             E2EE_METADATA_VERSION, nonce_b64, E2EE_CHUNK_SIZE,
             new_chunks, new_sha256, (int64_t)sanitized_len,
@@ -932,6 +964,14 @@ static int handle_scan(int fd, cJSON *json)
         cJSON_AddStringToObject(meta, "metadata_mac", result.new_metadata_mac);
         cJSON_AddBoolToObject(meta, "e2ee", 1);
         cJSON_AddItemToObject(resp, "new_encryption_meta", meta);
+    }
+
+    if (result.has_sealed_content_hash) {
+        char sealed_b64[2048];
+        sodium_bin2base64(sealed_b64, sizeof(sealed_b64),
+                          result.sealed_content_hash, result.sealed_content_hash_len,
+                          sodium_base64_VARIANT_ORIGINAL);
+        cJSON_AddStringToObject(resp, "sealed_content_hash", sealed_b64);
     }
 
     if (result.has_tee_signature) {
