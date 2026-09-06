@@ -60,67 +60,56 @@ int sanitize_video(
         snprintf(reason, reason_size, "%s", memfd_reason);
         return SANITIZE_ERROR;
     }
-    int in_fd = io.in_fd;
-    int out_fd = io.out_fd;
-    char *in_path = io.in_path;
-    char *out_path = io.out_path;
+    tee_attempt_chain_t chain;
+    tee_chain_begin(&chain, ffmpeg, &io, TEE_SCAN_CONVERTER_BUDGET_SECS, TEE_SUBPROC_WALL_CAP_SECS);
 
-    struct timespec scan_deadline;
-    tee_deadline_start(&scan_deadline, TEE_SCAN_CONVERTER_BUDGET_SECS);
-    int timed_out = 0;
+    char *out_path = tee_chain_next_output(&chain, NULL);
+    if (!out_path) {
+        tee_chain_abort(&chain);
+        snprintf(reason, reason_size, "memfd_create_failed");
+        return SANITIZE_ERROR;
+    }
 
     char *const remux_args[] = {
         (char *)ffmpeg, "-y", "-nostdin", "-loglevel", "warning",
-        "-i", in_path,
+        "-i", chain.in_path,
         "-map_metadata", "-1", "-map_chapters", "-1",
         "-c", "copy",
         "-f", (char *)fmt,
         out_path, NULL
     };
 
-    int rc = tee_spawn_converter(ffmpeg, remux_args, tee_secs_within(&scan_deadline, TEE_SUBPROC_WALL_CAP_SECS),
-                                 (const int[]){in_fd, out_fd}, 2);
-    if (rc == TEE_SUBPROC_TIMEOUT) timed_out = 1;
-
-    if (rc != 0) {
-        close(out_fd);
-
-        char renc_path[TEE_MEMFD_PATH_MAX];
-        int renc_fd = tee_memfd_create("tee_vid_renc", renc_path, sizeof(renc_path));
-        if (renc_fd < 0) {
-            close(in_fd);
+    if (tee_chain_run(&chain, remux_args) != 0) {
+        out_path = tee_chain_next_output(&chain, "tee_vid_renc");
+        if (!out_path) {
+            tee_chain_abort(&chain);
             snprintf(reason, reason_size, "memfd_create_failed");
             return SANITIZE_ERROR;
         }
 
         char *const reencode_args[] = {
             (char *)ffmpeg, "-y", "-nostdin", "-loglevel", "warning",
-            "-i", in_path,
+            "-i", chain.in_path,
             "-map_metadata", "-1", "-map_chapters", "-1",
             "-c:v", "libx264", "-preset", "fast", "-crf", "23",
             "-c:a", "aac", "-b:a", "128k",
             "-movflags", "+faststart",
             "-f", "mp4",
-            renc_path, NULL
+            out_path, NULL
         };
 
-        rc = tee_spawn_converter(ffmpeg, reencode_args, tee_secs_within(&scan_deadline, TEE_SUBPROC_WALL_CAP_SECS),
-                                 (const int[]){in_fd, renc_fd}, 2);
-        if (rc == TEE_SUBPROC_TIMEOUT) timed_out = 1;
-
-        if (rc != 0) {
-            close(in_fd);
-            close(renc_fd);
-            snprintf(reason, reason_size, "%s", timed_out ? "ffmpeg_timeout" : "ffmpeg_remux_and_reencode_failed");
-            return SANITIZE_ERROR;
-        }
-
-        out_fd = renc_fd;
+        tee_chain_run(&chain, reencode_args);
     }
 
-    close(in_fd);
-    if (tee_memfd_finish_output(out_fd, out, out_len, TEE_SUBPROC_MAX_OUTPUT_BYTES,
-                                "ffmpeg_empty_output", reason, reason_size) != 0) {
+    if (!chain.ok) {
+        tee_chain_abort(&chain);
+        snprintf(reason, reason_size, "%s",
+                 tee_chain_failure_reason(&chain, "ffmpeg_remux_and_reencode_failed"));
+        return SANITIZE_ERROR;
+    }
+
+    if (tee_chain_finish(&chain, out, out_len, TEE_SUBPROC_MAX_OUTPUT_BYTES,
+                         "ffmpeg_empty_output", reason, reason_size) != 0) {
         return SANITIZE_ERROR;
     }
     return SANITIZE_MODIFIED;

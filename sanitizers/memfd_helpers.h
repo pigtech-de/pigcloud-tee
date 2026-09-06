@@ -261,4 +261,78 @@ static inline int tee_spawn_converter(const char *bin, char *const argv[],
     return tee_wait_child(pid, timeout_secs, &status);
 }
 
+typedef struct {
+    const char *bin;
+    struct timespec deadline;
+    int per_attempt_cap;
+    int in_fd;
+    int out_fd;
+    char in_path[TEE_MEMFD_PATH_MAX];
+    char out_path[TEE_MEMFD_PATH_MAX];
+    int timed_out;
+    int ok;
+} tee_attempt_chain_t;
+
+static inline void tee_chain_begin(tee_attempt_chain_t *c, const char *bin,
+                                   const tee_memfd_pair_t *io,
+                                   int budget_secs, int per_attempt_cap)
+{
+    c->bin = bin;
+    tee_deadline_start(&c->deadline, budget_secs);
+    c->per_attempt_cap = per_attempt_cap;
+    c->in_fd = io->in_fd;
+    c->out_fd = io->out_fd;
+    snprintf(c->in_path, sizeof(c->in_path), "%s", io->in_path);
+    snprintf(c->out_path, sizeof(c->out_path), "%s", io->out_path);
+    c->timed_out = 0;
+    c->ok = 0;
+}
+
+static inline char *tee_chain_next_output(tee_attempt_chain_t *c, const char *retry_name)
+{
+    if (retry_name == NULL) {
+        return c->out_fd >= 0 ? c->out_path : NULL;
+    }
+    tee_memfd_close(&c->out_fd);
+    c->out_path[0] = '\0';
+    c->out_fd = tee_memfd_create(retry_name, c->out_path, sizeof(c->out_path));
+    return c->out_fd >= 0 ? c->out_path : NULL;
+}
+
+static inline int tee_chain_run(tee_attempt_chain_t *c, char *const argv[])
+{
+    if (c->out_fd < 0) {
+        c->ok = 0;
+        return TEE_SUBPROC_FAIL;
+    }
+    int rc = tee_spawn_converter(c->bin, argv,
+                                 tee_secs_within(&c->deadline, c->per_attempt_cap),
+                                 (const int[]){c->in_fd, c->out_fd}, 2);
+    if (rc == TEE_SUBPROC_TIMEOUT) c->timed_out = 1;
+    c->ok = (rc == TEE_SUBPROC_OK);
+    return rc;
+}
+
+static inline const char *tee_chain_failure_reason(const tee_attempt_chain_t *c,
+                                                   const char *decode_failed)
+{
+    return c->timed_out ? "ffmpeg_timeout" : decode_failed;
+}
+
+static inline void tee_chain_abort(tee_attempt_chain_t *c)
+{
+    tee_memfd_close(&c->in_fd);
+    tee_memfd_close(&c->out_fd);
+}
+
+static inline int tee_chain_finish(tee_attempt_chain_t *c,
+                                   unsigned char **out, size_t *out_len, size_t max_len,
+                                   const char *empty_reason, char *reason, size_t reason_size)
+{
+    tee_memfd_close(&c->in_fd);
+    int fd = c->out_fd;
+    c->out_fd = -1;
+    return tee_memfd_finish_output(fd, out, out_len, max_len, empty_reason, reason, reason_size);
+}
+
 #endif

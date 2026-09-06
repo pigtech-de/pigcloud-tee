@@ -3,6 +3,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
+#include <dirent.h>
 #include <sys/resource.h>
 
 #include "../sanitizers/memfd_helpers.h"
@@ -32,6 +33,124 @@ static long now_ms(void)
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
+
+static int open_fd_count(void)
+{
+    DIR *d = opendir("/proc/self/fd");
+    if (!d) return -1;
+    int n = 0;
+    while (readdir(d) != NULL) n++;
+    closedir(d);
+    return n;
+}
+
+static int chain_open(tee_attempt_chain_t *c, int budget_secs, int per_attempt_cap)
+{
+    tee_memfd_pair_t io;
+    const char *why = NULL;
+    if (tee_memfd_pair_open(&io, "chain_test_in", "chain_test_out",
+                            (const unsigned char *)MARKER, strlen(MARKER), &why) != 0) {
+        printf("  [FAIL] tee_memfd_pair_open: %s\n", why ? why : "?");
+        return -1;
+    }
+    tee_chain_begin(c, SH, &io, budget_secs, per_attempt_cap);
+    return 0;
+}
+
+static int chain_write_attempt(tee_attempt_chain_t *c, const char *out_path,
+                               const char *payload, int exit_code)
+{
+    char script[256];
+    snprintf(script, sizeof(script), "printf %s > %s; exit %d", payload, out_path, exit_code);
+    char *const argv[] = { (char *)SH, "-c", script, NULL };
+    return tee_chain_run(c, argv);
+}
+
+static void chain_cases(void)
+{
+    printf("\nconverter attempt chain (tee_attempt_chain_t)\n");
+    const int base = open_fd_count();
+
+    {
+        tee_attempt_chain_t c;
+        if (chain_open(&c, 30, 5) != 0) { g_failures++; return; }
+        char *first = tee_chain_next_output(&c, NULL);
+        check(first != NULL && strcmp(first, c.out_path) == 0,
+              "the first attempt writes to the pair's own output fd");
+        chain_write_attempt(&c, first, "ONE", 0);
+        check(c.ok == 1, "a clean first attempt wins the chain");
+
+        unsigned char *out = NULL;
+        size_t out_len = 0;
+        char reason[64] = "";
+        check(tee_chain_finish(&c, &out, &out_len, 1 << 20, "empty", reason, sizeof(reason)) == 0,
+              "finish reads the winning output back");
+        check(out_len == 3 && memcmp(out, "ONE", 3) == 0,
+              "the bytes returned are the winning attempt's, not the input's");
+        free(out);
+        check(open_fd_count() == base,
+              "a won chain leaves no fd open (input and output both closed)");
+    }
+
+    {
+        tee_attempt_chain_t c;
+        if (chain_open(&c, 30, 5) != 0) { g_failures++; return; }
+        char *first = tee_chain_next_output(&c, NULL);
+        chain_write_attempt(&c, first, "ONE", 3);
+        check(c.ok == 0, "a failing attempt does not win the chain");
+        check(lseek(c.out_fd, 0, SEEK_END) == 3, "the failing attempt did write to its output");
+        int after_attempt = open_fd_count();
+
+        char *retry = tee_chain_next_output(&c, "chain_test_retry");
+        check(retry != NULL, "a retry gets an output fd");
+        check(lseek(c.out_fd, 0, SEEK_END) == 0,
+              "the retry writes to a fresh memfd, not the spent attempt's leftovers");
+        check(open_fd_count() == after_attempt,
+              "a retry closes the output it replaced instead of leaking it");
+
+        chain_write_attempt(&c, retry, "TWO", 0);
+        unsigned char *out = NULL;
+        size_t out_len = 0;
+        char reason[64] = "";
+        check(tee_chain_finish(&c, &out, &out_len, 1 << 20, "empty", reason, sizeof(reason)) == 0
+                  && out_len == 3 && memcmp(out, "TWO", 3) == 0,
+              "the retry's output is what finish returns");
+        free(out);
+        check(open_fd_count() == base, "a retried chain leaves no fd open");
+    }
+
+    {
+        tee_attempt_chain_t c;
+        if (chain_open(&c, 30, 5) != 0) { g_failures++; return; }
+        chain_write_attempt(&c, tee_chain_next_output(&c, NULL), "ONE", 3);
+        chain_write_attempt(&c, tee_chain_next_output(&c, "chain_test_retry"), "TWO", 4);
+        check(c.ok == 0 && c.timed_out == 0, "every attempt failing is not a timeout");
+        check(strcmp(tee_chain_failure_reason(&c, "decode_failed"), "decode_failed") == 0,
+              "a plain all-attempts failure keeps the caller's reason");
+        tee_chain_abort(&c);
+        check(open_fd_count() == base, "abort closes both fds after a lost chain");
+    }
+
+    {
+        tee_attempt_chain_t c;
+        if (chain_open(&c, 30, 1) != 0) { g_failures++; return; }
+        char *first = tee_chain_next_output(&c, NULL);
+        char script[128];
+        snprintf(script, sizeof(script), "sleep 30 > %s", first);
+        char *const argv[] = { (char *)SH, "-c", script, NULL };
+        check(tee_chain_run(&c, argv) == TEE_SUBPROC_TIMEOUT, "a wedged attempt maps to TIMEOUT");
+        check(c.timed_out == 1, "the chain remembers the deadline kill");
+        check(strcmp(tee_chain_failure_reason(&c, "decode_failed"), "ffmpeg_timeout") == 0,
+              "a deadline kill reports ffmpeg_timeout, never the decode reason");
+
+        chain_write_attempt(&c, tee_chain_next_output(&c, "chain_test_retry"), "TWO", 0);
+        check(c.ok == 1, "a later attempt can still win after one timed out");
+        check(strcmp(tee_chain_failure_reason(&c, "decode_failed"), "ffmpeg_timeout") == 0,
+              "the timeout flag survives a retry, so a mixed chain still audits as a hang");
+        tee_chain_abort(&c);
+        check(open_fd_count() == base, "abort closes both fds after a timed-out chain");
+    }
 }
 
 int main(void)
@@ -132,6 +251,8 @@ int main(void)
         check(rc == TEE_SUBPROC_TIMEOUT, "a wedged converter maps to TIMEOUT");
         check(elapsed < 5000, "the deadline kill fires promptly (no watchdog wait)");
     }
+
+    chain_cases();
 
     printf("\n%s (%d failure%s)\n", g_failures ? "FAILURES" : "ALL PASSED",
            g_failures, g_failures == 1 ? "" : "s");

@@ -96,104 +96,72 @@ int sanitize_audio(
         snprintf(reason, reason_size, "%s", memfd_reason);
         return SANITIZE_ERROR;
     }
-    int in_fd = io.in_fd;
-    int out_fd = io.out_fd;
-    char *in_path = io.in_path;
-    char *out_path = io.out_path;
+    tee_attempt_chain_t chain;
+    tee_chain_begin(&chain, ffmpeg, &io, TEE_SCAN_CONVERTER_BUDGET_SECS, TEE_SUBPROC_WALL_CAP_SECS);
 
-    struct timespec scan_deadline;
-    tee_deadline_start(&scan_deadline, TEE_SCAN_CONVERTER_BUDGET_SECS);
-    int timed_out = 0;
+    char *out_path = tee_chain_next_output(&chain, NULL);
+    if (!out_path) {
+        tee_chain_abort(&chain);
+        snprintf(reason, reason_size, "memfd_create_failed");
+        return SANITIZE_ERROR;
+    }
 
     char *const remux_args[] = {
         (char *)ffmpeg, "-y", "-nostdin", "-loglevel", "warning",
-        "-i", in_path,
+        "-i", chain.in_path,
         "-map_metadata", "-1",
         "-c", "copy",
         "-f", (char *)fmt,
         out_path, NULL
     };
 
-    int rc = tee_spawn_converter(ffmpeg, remux_args, tee_secs_within(&scan_deadline, TEE_SUBPROC_WALL_CAP_SECS),
-                                 (const int[]){in_fd, out_fd}, 2);
-    if (rc == TEE_SUBPROC_TIMEOUT) timed_out = 1;
-
-    if (rc != 0) {
-        close(out_fd);
-        out_fd = -1;
-
+    if (tee_chain_run(&chain, remux_args) != 0) {
         const char *codec = ffmpeg_audio_codec(ext);
-        int renc_fd = -1;
+
         if (codec) {
-            char renc_path[TEE_MEMFD_PATH_MAX];
-            renc_fd = tee_memfd_create("tee_aud_renc", renc_path, sizeof(renc_path));
-            if (renc_fd >= 0) {
+            out_path = tee_chain_next_output(&chain, "tee_aud_renc");
+            if (out_path) {
                 char *const reencode_args[] = {
                     (char *)ffmpeg, "-y", "-nostdin", "-loglevel", "warning",
-                    "-i", in_path,
+                    "-i", chain.in_path,
                     "-map_metadata", "-1",
                     "-c:a", (char *)codec,
                     "-vn",
                     "-f", (char *)fmt,
-                    renc_path, NULL
+                    out_path, NULL
                 };
-
-                rc = tee_spawn_converter(ffmpeg, reencode_args, tee_secs_within(&scan_deadline, TEE_SUBPROC_WALL_CAP_SECS),
-                                         (const int[]){in_fd, renc_fd}, 2);
-                if (rc == TEE_SUBPROC_TIMEOUT) timed_out = 1;
-                if (rc != 0) {
-                    close(renc_fd);
-                    renc_fd = -1;
-                }
+                tee_chain_run(&chain, reencode_args);
             }
         }
 
-        if (rc != 0) {
-            if (codec) {
-                char lenient_path[TEE_MEMFD_PATH_MAX];
-                int lenient_fd = tee_memfd_create("tee_aud_lenient", lenient_path, sizeof(lenient_path));
-                if (lenient_fd >= 0) {
-                    char *const lenient_args[] = {
-                        (char *)ffmpeg, "-y", "-nostdin", "-loglevel", "warning",
-                        "-err_detect", "ignore_err",
-                        "-fflags", "+genpts+discardcorrupt",
-                        "-i", in_path,
-                        "-map_metadata", "-1",
-                        "-c:a", (char *)codec,
-                        "-vn",
-                        "-f", (char *)fmt,
-                        lenient_path, NULL
-                    };
-
-                    rc = tee_spawn_converter(ffmpeg, lenient_args, tee_secs_within(&scan_deadline, TEE_SUBPROC_WALL_CAP_SECS),
-                                             (const int[]){in_fd, lenient_fd}, 2);
-                    if (rc == TEE_SUBPROC_TIMEOUT) timed_out = 1;
-                    if (rc == 0) {
-                        renc_fd = lenient_fd;
-                    } else {
-                        close(lenient_fd);
-                    }
-                }
+        if (!chain.ok && codec) {
+            out_path = tee_chain_next_output(&chain, "tee_aud_lenient");
+            if (out_path) {
+                char *const lenient_args[] = {
+                    (char *)ffmpeg, "-y", "-nostdin", "-loglevel", "warning",
+                    "-err_detect", "ignore_err",
+                    "-fflags", "+genpts+discardcorrupt",
+                    "-i", chain.in_path,
+                    "-map_metadata", "-1",
+                    "-c:a", (char *)codec,
+                    "-vn",
+                    "-f", (char *)fmt,
+                    out_path, NULL
+                };
+                tee_chain_run(&chain, lenient_args);
             }
         }
-
-        if (rc != 0 || renc_fd < 0) {
-            if (timed_out) {
-                close(in_fd);
-                snprintf(reason, reason_size, "ffmpeg_timeout");
-                return SANITIZE_ERROR;
-            }
-            close(in_fd);
-            snprintf(reason, reason_size, "ffmpeg_sanitize_failed");
-            return SANITIZE_ERROR;
-        }
-
-        out_fd = renc_fd;
     }
 
-    close(in_fd);
-    if (tee_memfd_finish_output(out_fd, out, out_len, TEE_SUBPROC_MAX_OUTPUT_BYTES,
-                                "ffmpeg_empty_output", reason, reason_size) != 0) {
+    if (!chain.ok) {
+        tee_chain_abort(&chain);
+        snprintf(reason, reason_size, "%s",
+                 tee_chain_failure_reason(&chain, "ffmpeg_sanitize_failed"));
+        return SANITIZE_ERROR;
+    }
+
+    if (tee_chain_finish(&chain, out, out_len, TEE_SUBPROC_MAX_OUTPUT_BYTES,
+                         "ffmpeg_empty_output", reason, reason_size) != 0) {
         return SANITIZE_ERROR;
     }
     return SANITIZE_MODIFIED;
