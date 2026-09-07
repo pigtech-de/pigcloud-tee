@@ -53,6 +53,8 @@ static atomic_ulong g_scan_duration_total_ms = 0;
 static atomic_int g_inflight = 0;
 static atomic_llong g_inflight_bytes = 0;
 static atomic_ulong g_scans_busy = 0;
+static atomic_ulong g_scans_user_busy = 0;
+static tee_submitter_table_t g_submitters;
 
 static uid_t g_expected_peer_uid = (uid_t)-1;
 
@@ -219,6 +221,17 @@ static int send_busy(int fd)
     return rc;
 }
 
+static int send_user_busy(int fd)
+{
+    cJSON *resp = tee_admission_user_busy_response();
+    if (!resp) {
+        return -1;
+    }
+    int rc = send_message(fd, resp);
+    cJSON_Delete(resp);
+    return rc;
+}
+
 static int handle_health(int fd)
 {
     cJSON *resp = cJSON_CreateObject();
@@ -249,6 +262,7 @@ static int handle_metrics(int fd)
     cJSON_AddNumberToObject(resp, "scan_duration_total_ms", (double)atomic_load(&g_scan_duration_total_ms));
     cJSON_AddNumberToObject(resp, "inflight", (double)atomic_load(&g_inflight));
     cJSON_AddNumberToObject(resp, "scans_busy", (double)atomic_load(&g_scans_busy));
+    cJSON_AddNumberToObject(resp, "scans_user_busy", (double)atomic_load(&g_scans_user_busy));
     cJSON_AddNumberToObject(resp, "inflight_bytes", (double)atomic_load(&g_inflight_bytes));
     cJSON_AddNumberToObject(resp, "mem_budget_bytes", (double)TEE_SCAN_MEM_BUDGET_BYTES);
     cJSON_AddNumberToObject(resp, "audit_write_failures", (double)audit_write_failures());
@@ -750,6 +764,7 @@ static int handle_scan(int fd, cJSON *json)
     size_t sanitized_len = 0;
     long long reserve_bytes = 0;
     int reserved = 0;
+    int user_slot = 0;
     int detached = 0;
     const char *fail_reason = NULL;
     char derived_sha256[SHA256_HEX_BUF] = {0};
@@ -758,6 +773,13 @@ static int handle_scan(int fd, cJSON *json)
         fail_reason = "invalid_request";
         goto scan_failed;
     }
+
+    if (tee_submitter_acquire(&g_submitters, req.user_id) != 0) {
+        atomic_fetch_add(&g_scans_user_busy, 1);
+        atomic_fetch_sub(&g_inflight, 1);
+        return send_user_busy(fd);
+    }
+    user_slot = 1;
 
     char unseal_reason[96];
     if (scanner_unseal_via_signer(
@@ -773,6 +795,7 @@ static int handle_scan(int fd, cJSON *json)
     if (tee_admission_reserve(&g_inflight_bytes, reserve_bytes) != 0) {
         atomic_fetch_add(&g_scans_busy, 1);
         sodium_memzero(data_key, sizeof(data_key));
+        tee_submitter_release(&g_submitters, req.user_id);
         atomic_fetch_sub(&g_inflight, 1);
         return send_busy(fd);
     }
@@ -1030,6 +1053,7 @@ static int handle_scan(int fd, cJSON *json)
 
     atomic_fetch_add(&g_scans_completed, 1);
     tee_admission_release(&g_inflight_bytes, reserve_bytes);
+    tee_submitter_release(&g_submitters, req.user_id);
     atomic_fetch_sub(&g_inflight, 1);
     return rc;
 
@@ -1046,6 +1070,9 @@ scan_failed:
     sodium_memzero(data_key, sizeof(data_key));
     if (reserved) {
         tee_admission_release(&g_inflight_bytes, reserve_bytes);
+    }
+    if (user_slot) {
+        tee_submitter_release(&g_submitters, req.user_id);
     }
     audit_scan_failure(req.user_id, derived_sha256,
                        fail_reason, scan_elapsed_ms(&ts_start));
@@ -1409,6 +1436,7 @@ static int tee_start_workers(pthread_t *workers, void *(*loop)(void *),
                              const char *role)
 {
     tee_queue_init(&g_queue);
+    tee_submitter_table_init(&g_submitters);
     for (int i = 0; i < WORKER_POOL_SIZE; i++) {
         if (pthread_create(&workers[i], NULL, loop, NULL) != 0) {
             fprintf(stderr, "FATAL: pthread_create %s worker %d failed\n", role, i);

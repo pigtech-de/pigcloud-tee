@@ -37,6 +37,8 @@
 #define REASON_SCANNER_BUSY      "scanner_busy"
 #define TEE_BUSY_RETRY_AFTER_MS  2000
 
+#define REASON_SCANNER_USER_BUSY "scanner_user_busy"
+
 #define E2EE_CHUNK_SIZE       (1024 * 1024)
 #define E2EE_KEY_SIZE         32
 #define E2EE_NONCE_SIZE       24

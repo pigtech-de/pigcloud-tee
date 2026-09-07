@@ -288,13 +288,187 @@ static void test_deadline_rejected_wins(void)
           tee_scan_past_deadline(VERDICT_ERROR, cap_ms + 1) == 1);
 }
 
+static tee_submitter_table_t g_subs;
+static uint64_t g_job_user[MAX_JOBS];
+static atomic_int g_user_concurrent[3];
+static atomic_int g_user_peak[3];
+static atomic_int g_user_done[3];
+static atomic_int g_user_shed[3];
+
+static void run_user_job(int id, unsigned scan_us)
+{
+    uint64_t uid = g_job_user[id];
+    if (tee_submitter_acquire(&g_subs, uid) != 0) {
+        atomic_fetch_add(&g_user_shed[uid], 1);
+        atomic_store(&g_job_result[id], RES_BUSY);
+        return;
+    }
+    int cur = atomic_fetch_add(&g_user_concurrent[uid], 1) + 1;
+    int peak = atomic_load(&g_user_peak[uid]);
+    while (cur > peak && !atomic_compare_exchange_weak(&g_user_peak[uid], &peak, cur)) { }
+    if (scan_us) {
+        usleep(scan_us);
+    }
+    atomic_fetch_sub(&g_user_concurrent[uid], 1);
+    tee_submitter_release(&g_subs, uid);
+    atomic_fetch_add(&g_user_done[uid], 1);
+    atomic_store(&g_job_result[id], RES_DONE);
+}
+
+static void *fairness_worker_loop(void *arg)
+{
+    (void)arg;
+    for (;;) {
+        int id = tee_queue_pop(&q);
+        if (id < 0) {
+            return NULL;
+        }
+        run_user_job(id, g_scan_us);
+    }
+}
+
+static void test_per_user_cap(void)
+{
+    printf("(h) per-submitter in-flight cap admits %d and refuses the next\n",
+           TEE_MAX_INFLIGHT_SCANS_PER_USER);
+    tee_submitter_table_init(&g_subs);
+
+    int admitted = 0;
+    for (int i = 0; i < TEE_MAX_INFLIGHT_SCANS_PER_USER; i++) {
+        admitted += (tee_submitter_acquire(&g_subs, 7) == 0);
+    }
+    check("submitter admits up to the cap", admitted == TEE_MAX_INFLIGHT_SCANS_PER_USER);
+    check("one past the cap is refused", tee_submitter_acquire(&g_subs, 7) != 0);
+    check("held count equals the cap",
+          tee_submitter_inflight(&g_subs, 7) == (unsigned)TEE_MAX_INFLIGHT_SCANS_PER_USER);
+    check("a different submitter is still admitted", tee_submitter_acquire(&g_subs, 8) == 0);
+    check("two submitters hold slots", tee_submitter_table_used(&g_subs) == 2);
+
+    tee_submitter_release(&g_subs, 7);
+    check("release frees one slot for the capped submitter",
+          tee_submitter_acquire(&g_subs, 7) == 0);
+    for (int i = 0; i < TEE_MAX_INFLIGHT_SCANS_PER_USER; i++) {
+        tee_submitter_release(&g_subs, 7);
+    }
+    check("the capped submitter drained to zero", tee_submitter_inflight(&g_subs, 7) == 0);
+    tee_submitter_release(&g_subs, 7);
+    check("an extra release never underflows", tee_submitter_inflight(&g_subs, 7) == 0);
+    tee_submitter_release(&g_subs, 8);
+    check("the table drained to zero entries", tee_submitter_table_used(&g_subs) == 0);
+    check("an unparsed request (user_id 0) is refused, not counted",
+          tee_submitter_acquire(&g_subs, 0) != 0 && tee_submitter_table_used(&g_subs) == 0);
+}
+
+static void test_submitter_table_bound(void)
+{
+    printf("(i) the submitter table is bounded and reusable\n");
+    tee_submitter_table_init(&g_subs);
+    int filled = 0;
+    for (int i = 0; i < TEE_SUBMITTER_TABLE_SIZE; i++) {
+        filled += (tee_submitter_acquire(&g_subs, (uint64_t)(1000 + i)) == 0);
+    }
+    check("every table slot took a distinct submitter", filled == TEE_SUBMITTER_TABLE_SIZE);
+    check("table entries never exceed the bound",
+          tee_submitter_table_used(&g_subs) == TEE_SUBMITTER_TABLE_SIZE);
+    check("a submitter past the table bound sheds rather than going uncounted",
+          tee_submitter_acquire(&g_subs, 999999) != 0);
+    tee_submitter_release(&g_subs, 1000);
+    check("a freed slot is reused", tee_submitter_acquire(&g_subs, 999999) == 0);
+    tee_submitter_release(&g_subs, 999999);
+    for (int i = 1; i < TEE_SUBMITTER_TABLE_SIZE; i++) {
+        tee_submitter_release(&g_subs, (uint64_t)(1000 + i));
+    }
+    check("the table drained to zero entries", tee_submitter_table_used(&g_subs) == 0);
+}
+
+static void test_fair_share_under_load(void)
+{
+    printf("(j) one submitter's burst never starves another\n");
+    reset_state();
+    tee_submitter_table_init(&g_subs);
+    for (int u = 0; u < 3; u++) {
+        atomic_store(&g_user_concurrent[u], 0);
+        atomic_store(&g_user_peak[u], 0);
+        atomic_store(&g_user_done[u], 0);
+        atomic_store(&g_user_shed[u], 0);
+    }
+    g_scan_us = 3000;
+    pthread_t w[WORKER_POOL_SIZE];
+    for (int i = 0; i < WORKER_POOL_SIZE; i++) {
+        pthread_create(&w[i], NULL, fairness_worker_loop, NULL);
+    }
+    const int hog_jobs = 240;
+    const int victim_jobs = 20;
+    int id = 0;
+    for (int i = 0; i < hog_jobs; i++, id++) {
+        g_job_user[id] = 1;
+        while (tee_queue_try_push(&q, id) != 0) {
+            usleep(100);
+        }
+        if (i % 12 == 11 && id + 1 < MAX_JOBS && (i / 12) < victim_jobs) {
+            id++;
+            g_job_user[id] = 2;
+            while (tee_queue_try_push(&q, id) != 0) {
+                usleep(100);
+            }
+        }
+    }
+    tee_queue_shutdown(&q);
+    for (int i = 0; i < WORKER_POOL_SIZE; i++) {
+        pthread_join(w[i], NULL);
+    }
+    check("the hog never held more than the cap at once",
+          atomic_load(&g_user_peak[1]) <= TEE_MAX_INFLIGHT_SCANS_PER_USER);
+    check("the hog was actually capped (some of its scans shed)",
+          atomic_load(&g_user_shed[1]) > 0);
+    check("the second submitter's scans still ran",
+          atomic_load(&g_user_done[2]) > 0);
+    check("the second submitter was never shed",
+          atomic_load(&g_user_shed[2]) == 0);
+    check("every slot was released", tee_submitter_table_used(&g_subs) == 0);
+    printf("      hog done=%d shed=%d peak=%d | other done=%d shed=%d\n",
+           atomic_load(&g_user_done[1]), atomic_load(&g_user_shed[1]),
+           atomic_load(&g_user_peak[1]),
+           atomic_load(&g_user_done[2]), atomic_load(&g_user_shed[2]));
+}
+
+static void test_user_busy_reply_shape(void)
+{
+    printf("(k) scanner_user_busy reply keeps the scanner_busy retry contract\n");
+    cJSON *busy = tee_admission_user_busy_response();
+    if (!busy) {
+        check("tee_admission_user_busy_response allocated a reply", 0);
+        return;
+    }
+    const cJSON *verdict = cJSON_GetObjectItemCaseSensitive(busy, "verdict");
+    const cJSON *reason  = cJSON_GetObjectItemCaseSensitive(busy, "reason");
+    const cJSON *flag    = cJSON_GetObjectItemCaseSensitive(busy, "busy");
+    const cJSON *retry   = cJSON_GetObjectItemCaseSensitive(busy, "retry_after_ms");
+
+    check("verdict stays error so pre-busy clients fail closed",
+          cJSON_IsString(verdict) && strcmp(verdict->valuestring, VERDICT_ERROR) == 0);
+    check("reason names the per-submitter shed",
+          cJSON_IsString(reason) && strcmp(reason->valuestring, REASON_SCANNER_USER_BUSY) == 0);
+    check("busy is a JSON true, so PHP sheds 429 instead of failing the upload",
+          flag != NULL && cJSON_IsTrue(flag));
+    check("retry_after_ms matches the scanner_busy shed, so chunks park no longer",
+          cJSON_IsNumber(retry) && retry->valuedouble == (double)TEE_BUSY_RETRY_AFTER_MS);
+
+    char *json = cJSON_PrintUnformatted(busy);
+    if (json) {
+        printf("      %s\n", json);
+        free(json);
+    }
+    cJSON_Delete(busy);
+}
+
 int main(void)
 {
     printf("SCALE-21 admission-control harness "
-           "(budget=%lluGB, MemoryMax=%lluGB, pool=%d, queue=%d)\n\n",
+           "(budget=%lluGB, MemoryMax=%lluGB, pool=%d, queue=%d, per-user=%d)\n\n",
            (unsigned long long)(TEE_SCAN_MEM_BUDGET_BYTES / (1024 * 1024 * 1024)),
            (unsigned long long)(TEE_MEMORYMAX_BYTES / (1024 * 1024 * 1024)),
-           WORKER_POOL_SIZE, WORK_QUEUE_CAPACITY);
+           WORKER_POOL_SIZE, WORK_QUEUE_CAPACITY, TEE_MAX_INFLIGHT_SCANS_PER_USER);
     test_budget_shed();
     test_full_queue_nonblocking();
     test_watchdog_not_starved();
@@ -302,6 +476,10 @@ int main(void)
     test_busy_reply_shape();
     test_monitor_cron_pool_size();
     test_deadline_rejected_wins();
+    test_per_user_cap();
+    test_submitter_table_bound();
+    test_fair_share_under_load();
+    test_user_busy_reply_shape();
     printf("\n%s (%d failure%s)\n", g_failures ? "FAILED" : "ALL PASSED",
            g_failures, g_failures == 1 ? "" : "s");
     return g_failures ? 1 : 0;

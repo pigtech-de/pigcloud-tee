@@ -42,7 +42,33 @@ int tee_admission_reserve(atomic_llong *inflight_bytes, long long reserve_bytes)
 
 void tee_admission_release(atomic_llong *inflight_bytes, long long reserve_bytes);
 
+#define TEE_MAX_INFLIGHT_SCANS_PER_USER 2
+
+#define TEE_SUBMITTER_TABLE_SIZE WORK_QUEUE_CAPACITY
+
+typedef struct {
+    uint64_t user_id;
+    unsigned count;
+} tee_submitter_slot_t;
+
+typedef struct {
+    tee_submitter_slot_t slots[TEE_SUBMITTER_TABLE_SIZE];
+    pthread_mutex_t mu;
+} tee_submitter_table_t;
+
+void tee_submitter_table_init(tee_submitter_table_t *t);
+
+int tee_submitter_acquire(tee_submitter_table_t *t, uint64_t user_id);
+
+void tee_submitter_release(tee_submitter_table_t *t, uint64_t user_id);
+
+unsigned tee_submitter_inflight(tee_submitter_table_t *t, uint64_t user_id);
+
+int tee_submitter_table_used(tee_submitter_table_t *t);
+
 cJSON *tee_admission_busy_response(void);
+
+cJSON *tee_admission_user_busy_response(void);
 
 int tee_scan_past_deadline(const char *verdict, uint64_t elapsed_ms);
 
