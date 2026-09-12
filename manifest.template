@@ -47,7 +47,7 @@ uri = "file:{{ gramine.runtimedir() }}/"
 uri = "file:{{ arch_libdir }}/libsodium.so.23"
 
 [[sgx.trusted_files]]
-uri = "file:/usr/local/lib/liboqs.so.8"
+uri = "file:/usr/local/lib/liboqs.so.9"
 
 [[sgx.trusted_files]]
 uri = "file:{{ arch_libdir }}/libmagic.so.1"

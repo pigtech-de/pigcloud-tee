@@ -1,0 +1,12 @@
+-xc
+-std=c11
+-Wall
+-Wextra
+-Wno-unused-parameter
+-pthread
+-I.
+-DHAVE_SYSTEMD
+-DHAVE_YARA
+-DHAVE_SECCOMP
+-DHAVE_ZLIB
+-DTEE_MONITOR_CRON="deploy/monitor-cron.sh"
