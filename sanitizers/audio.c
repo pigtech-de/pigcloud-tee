@@ -1,0 +1,168 @@
+#define _GNU_SOURCE
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <strings.h>
+#include <signal.h>
+#include <unistd.h>
+#include <sys/wait.h>
+#include "sanitizers.h"
+#include "memfd_helpers.h"
+#include "../scanner_whitelist.h"
+
+static const char *ffmpeg_audio_format(const char *ext)
+{
+    if (!ext || ext[0] == '\0') return "mp3";
+    if (strcasecmp(ext, "mp3") == 0) return "mp3";
+    if (strcasecmp(ext, "flac") == 0) return "flac";
+    if (strcasecmp(ext, "ogg") == 0) return "ogg";
+    if (strcasecmp(ext, "oga") == 0) return "ogg";
+    if (strcasecmp(ext, "opus") == 0) return "ogg";
+    if (strcasecmp(ext, "m4a") == 0) return "ipod";
+    if (strcasecmp(ext, "m4r") == 0) return "ipod";
+    if (strcasecmp(ext, "m4b") == 0) return "ipod";
+    if (strcasecmp(ext, "aac") == 0) return "ipod";
+    if (strcasecmp(ext, "wav") == 0) return "wav";
+    if (strcasecmp(ext, "weba") == 0) return "webm";
+    if (strcasecmp(ext, "aiff") == 0 || strcasecmp(ext, "aif") == 0) return "aiff";
+    if (strcasecmp(ext, "mka") == 0) return "matroska";
+    if (strcasecmp(ext, "wma") == 0) return "asf";
+    if (strcasecmp(ext, "caf") == 0) return "caf";
+    if (strcasecmp(ext, "amr") == 0) return "amr";
+    if (strcasecmp(ext, "au") == 0 || strcasecmp(ext, "snd") == 0) return "au";
+    if (strcasecmp(ext, "mid") == 0 || strcasecmp(ext, "midi") == 0) return "mp3";
+    return "mp3";
+}
+
+static const char *ffmpeg_audio_codec(const char *ext)
+{
+    if (!ext || ext[0] == '\0') return NULL;
+    if (strcasecmp(ext, "mp3") == 0) return "libmp3lame";
+    if (strcasecmp(ext, "flac") == 0) return "flac";
+    if (strcasecmp(ext, "ogg") == 0 || strcasecmp(ext, "oga") == 0) return "libvorbis";
+    if (strcasecmp(ext, "opus") == 0) return "libopus";
+    if (strcasecmp(ext, "m4a") == 0 || strcasecmp(ext, "m4r") == 0 ||
+        strcasecmp(ext, "m4b") == 0 || strcasecmp(ext, "aac") == 0) return "aac";
+    if (strcasecmp(ext, "wav") == 0 || strcasecmp(ext, "caf") == 0) return "pcm_s16le";
+    if (strcasecmp(ext, "aiff") == 0 || strcasecmp(ext, "aif") == 0 ||
+        strcasecmp(ext, "au") == 0 || strcasecmp(ext, "snd") == 0) return "pcm_s16be";
+    if (strcasecmp(ext, "weba") == 0 || strcasecmp(ext, "mka") == 0) return "libopus";
+    if (strcasecmp(ext, "wma") == 0) return "wmav2";
+    if (strcasecmp(ext, "amr") == 0) return "libopencore_amrnb";
+    return NULL;
+}
+
+static int ext_is_opaque(const char *ext)
+{
+    if (!ext || ext[0] == '\0') return 0;
+    for (int i = 0; OPAQUE_BINARY_EXTS[i]; i++) {
+        if (strcasecmp(ext, OPAQUE_BINARY_EXTS[i]) == 0) return 1;
+    }
+    return 0;
+}
+
+int sanitize_audio(
+    const unsigned char *data, size_t len,
+    const char *ext,
+    unsigned char **out, size_t *out_len,
+    char *reason, size_t reason_size)
+{
+    *out = NULL;
+    *out_len = 0;
+
+    if (ext_is_opaque(ext)) {
+        snprintf(reason, reason_size, "opaque_audio_passthrough");
+        return SANITIZE_CLEAN;
+    }
+
+    if (len > TEE_AUDIO_MAX_INPUT_BYTES) {
+        snprintf(reason, reason_size, "audio_too_large");
+        return SANITIZE_REJECTED;
+    }
+
+    const char *ffmpeg = tee_find_binary(TEE_FFMPEG_CANDIDATES);
+    if (!ffmpeg) {
+        snprintf(reason, reason_size, "ffmpeg_not_installed");
+        return SANITIZE_ERROR;
+    }
+
+    const char *fmt = ffmpeg_audio_format(ext);
+
+    tee_memfd_pair_t io;
+    const char *memfd_reason = NULL;
+    if (tee_memfd_pair_open(&io, "tee_aud_in", "tee_aud_out",
+                            data, len, &memfd_reason) != 0) {
+        snprintf(reason, reason_size, "%s", memfd_reason);
+        return SANITIZE_ERROR;
+    }
+    tee_attempt_chain_t chain;
+    tee_chain_begin(&chain, ffmpeg, &io, TEE_SCAN_CONVERTER_BUDGET_SECS, TEE_SUBPROC_WALL_CAP_SECS);
+
+    char *out_path = tee_chain_next_output(&chain, NULL);
+    if (!out_path) {
+        tee_chain_abort(&chain);
+        snprintf(reason, reason_size, "memfd_create_failed");
+        return SANITIZE_ERROR;
+    }
+
+    char *const remux_args[] = {
+        (char *)ffmpeg, "-y", "-nostdin", "-loglevel", "warning",
+        "-i", chain.in_path,
+        "-map_metadata", "-1",
+        "-c", "copy",
+        "-f", (char *)fmt,
+        out_path, NULL
+    };
+
+    if (tee_chain_run(&chain, remux_args) != 0) {
+        const char *codec = ffmpeg_audio_codec(ext);
+
+        if (codec) {
+            out_path = tee_chain_next_output(&chain, "tee_aud_renc");
+            if (out_path) {
+                char *const reencode_args[] = {
+                    (char *)ffmpeg, "-y", "-nostdin", "-loglevel", "warning",
+                    "-i", chain.in_path,
+                    "-map_metadata", "-1",
+                    "-c:a", (char *)codec,
+                    "-vn",
+                    "-f", (char *)fmt,
+                    out_path, NULL
+                };
+                tee_chain_run(&chain, reencode_args);
+            }
+        }
+
+        if (!chain.ok && codec) {
+            out_path = tee_chain_next_output(&chain, "tee_aud_lenient");
+            if (out_path) {
+                char *const lenient_args[] = {
+                    (char *)ffmpeg, "-y", "-nostdin", "-loglevel", "warning",
+                    "-err_detect", "ignore_err",
+                    "-fflags", "+genpts+discardcorrupt",
+                    "-i", chain.in_path,
+                    "-map_metadata", "-1",
+                    "-c:a", (char *)codec,
+                    "-vn",
+                    "-f", (char *)fmt,
+                    out_path, NULL
+                };
+                tee_chain_run(&chain, lenient_args);
+            }
+        }
+    }
+
+    if (!chain.ok) {
+        tee_chain_abort(&chain);
+        snprintf(reason, reason_size, "%s",
+                 tee_chain_failure_reason(&chain, "ffmpeg_sanitize_failed"));
+        return SANITIZE_ERROR;
+    }
+
+    if (tee_chain_finish(&chain, out, out_len, TEE_SUBPROC_MAX_OUTPUT_BYTES,
+                         "ffmpeg_empty_output", reason, reason_size) != 0) {
+        return SANITIZE_ERROR;
+    }
+    return SANITIZE_MODIFIED;
+}

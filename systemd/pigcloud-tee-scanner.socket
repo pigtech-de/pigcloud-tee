@@ -1,0 +1,15 @@
+[Unit]
+Description=PigCloud TEE File Scanner Socket
+
+[Socket]
+ListenStream=/run/pigcloud-tee/scanner.sock
+RuntimeDirectory=pigcloud-tee
+RuntimeDirectoryMode=0750
+SocketUser=pigcloud-tee
+SocketGroup=www-data
+SocketMode=0660
+Backlog=64
+RemoveOnStop=true
+
+[Install]
+WantedBy=sockets.target

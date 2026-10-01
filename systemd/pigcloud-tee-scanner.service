@@ -1,0 +1,57 @@
+[Unit]
+Description=PigCloud TEE File Scanner
+Requires=pigcloud-tee-scanner.socket pigcloud-tee-signer.service
+After=network.target pigcloud-tee-scanner.socket pigcloud-tee-signer.service
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=notify
+ExecStart=/usr/local/bin/pigcloud-tee-scanner
+
+User=pigcloud-tee
+Group=www-data
+
+WatchdogSec=600
+Restart=on-failure
+RestartSec=5
+
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+RestrictAddressFamilies=AF_UNIX
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources @keyring @swap @module @mount @obsolete @raw-io @reboot @cpu-emulation @debug @pkey
+SystemCallFilter=seccomp
+
+Environment=TEE_SECCOMP_MODE=enforce
+
+LimitNOFILE=8192
+LimitNPROC=256
+MemoryMax=32G
+CPUQuota=400%
+
+ReadWritePaths=/var/www/pigtech/private/uploads/quarantine/sanitized /var/log/pigcloud-tee
+
+EnvironmentFile=/etc/pigcloud-tee/audit.env
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=pigcloud-tee-scanner
+
+[Install]
+WantedBy=multi-user.target
