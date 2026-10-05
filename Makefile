@@ -168,7 +168,7 @@ e2e-self-check:
 	$(PYTHON) tests/e2e_test.py --self-check
 
 vector-check: tests/vector_check
-	./tests/vector_check ../tests/vectors/chunked_file_v1.json
+	./tests/vector_check ../tests/vectors/chunked_file_v1.json ../tests/vectors/file_signature_v1.json
 
 tests/vector_check: tests/vector_check.c crypto.c crypto.h protocol.h vendor/cjson/cJSON.c vendor/cjson/cJSON.h
 	$(CC) $(CFLAGS) -o $@ tests/vector_check.c crypto.c vendor/cjson/cJSON.c -lsodium -loqs

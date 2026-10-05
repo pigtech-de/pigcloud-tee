@@ -165,6 +165,7 @@ def self_check():
     try:
         hv = _load_vector("hybrid_seal_v1.json")
         cv = _load_vector("chunked_file_v1.json")
+        sv = _load_vector("file_signature_v1.json")
     except (IOError, OSError):
         print("   WARN: vectors absent under {}".format(os.path.normpath(VECTOR_DIR)))
         print("         seal construction UNVERIFIED; set TEE_VECTOR_DIR to enable")
@@ -214,13 +215,25 @@ def self_check():
         bad.append("metadata MAC canonical form diverged: {} != {}".format(
             got_mac[:16], meta["metadata_mac"][:16]))
 
+    import nacl.signing
+    import nacl.exceptions
+    tee_input = tee_signature_domain() + hashlib.sha256(d(sv["ciphertext_b64"])).digest()
+    try:
+        nacl.signing.VerifyKey(d(sv["signing_pub"]["ed25519_b64"])).verify(
+            tee_input, d(sv["tee"]["sig_ed25519_b64"]))
+    except nacl.exceptions.BadSignatureError:
+        bad.append("file_signature_v1: the committed tee pair does not verify over "
+                   "domains.tee || sha256(ciphertext), the input verify_tee_signatures builds")
+
     if bad:
         raise RuntimeError(
             "harness diverged from tests/vectors/:\n     - " + "\n     - ".join(bad))
-    print("   vectors OK: hybrid_seal_v1 + chunked_file_v1 (seal, chunks, MAC)")
+    print("   vectors OK: hybrid_seal_v1 + chunked_file_v1 (seal, chunks, MAC)"
+          " + file_signature_v1 (tee signing input)")
     return True
 
-TEE_SIGNATURE_DOMAIN = b"pigcloud-tee-file-signature-v1"
+def tee_signature_domain():
+    return _load_vector("file_signature_v1.json")["domains"]["tee"].encode()
 
 def verify_tee_signatures(result, attest, sanitized_path):
     import nacl.signing
@@ -239,7 +252,13 @@ def verify_tee_signatures(result, attest, sanitized_path):
     except (IOError, OSError) as exc:
         return ["cannot read sanitized output {}: {}".format(sanitized_path, exc)]
 
-    signed_input = TEE_SIGNATURE_DOMAIN + hashlib.sha256(ciphertext).digest()
+    try:
+        domain = tee_signature_domain()
+    except (IOError, OSError, KeyError) as exc:
+        return ["cannot read the TEE signature domain from file_signature_v1.json "
+                "under {} ({}); set TEE_VECTOR_DIR".format(
+                    os.path.normpath(VECTOR_DIR), exc)]
+    signed_input = domain + hashlib.sha256(ciphertext).digest()
 
     pk_ed = base64.b64decode(attest.get("enclave_signing_pk_ed25519", ""))
     if len(pk_ed) != 32:

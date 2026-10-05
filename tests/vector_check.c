@@ -6,6 +6,7 @@
 #include <unistd.h>
 
 #include <sodium.h>
+#include <oqs/oqs.h>
 
 #include "../crypto.h"
 #include "../protocol.h"
@@ -67,9 +68,22 @@ static double num_field(const cJSON *obj, const char *key)
     return item->valuedouble;
 }
 
+static void temp_template(char *out, size_t size, const char *stem)
+{
+    const char *dir = getenv("TMPDIR");
+    if (!dir || !*dir) {
+        dir = "/tmp";
+    }
+    int n = snprintf(out, size, "%s/%s-XXXXXX", dir, stem);
+    if (n < 0 || (size_t)n >= size) {
+        fprintf(stderr, "temp path too long\n");
+        exit(1);
+    }
+}
+
 static void write_temp(const unsigned char *data, size_t len, char *path_out, size_t path_size)
 {
-    snprintf(path_out, path_size, "/tmp/pigcloud-vector-XXXXXX");
+    temp_template(path_out, path_size, "pigcloud-vector");
     int fd = mkstemp(path_out);
     if (fd < 0) {
         fprintf(stderr, "mkstemp failed\n");
@@ -87,35 +101,24 @@ static void write_temp(const unsigned char *data, size_t len, char *path_out, si
     close(fd);
 }
 
-int main(int argc, char **argv)
+static cJSON *load_fixture(const char *path)
 {
-    if (argc != 2) {
-        fprintf(stderr, "usage: %s <chunked_file_v1.json>\n", argv[0]);
-        return 1;
-    }
-    if (sodium_init() < 0) {
-        fprintf(stderr, "sodium_init failed\n");
-        return 1;
-    }
-
-    FILE *f = fopen(argv[1], "rb");
+    FILE *f = fopen(path, "rb");
     if (!f) {
-        fprintf(stderr, "cannot open %s\n", argv[1]);
-        return 1;
+        fprintf(stderr, "cannot open %s\n", path);
+        exit(1);
     }
     fseek(f, 0, SEEK_END);
     long fsize = ftell(f);
     fseek(f, 0, SEEK_SET);
     if (fsize <= 0) {
-        fprintf(stderr, "empty fixture\n");
-        fclose(f);
-        return 1;
+        fprintf(stderr, "empty fixture %s\n", path);
+        exit(1);
     }
     char *raw = malloc((size_t)fsize + 1);
     if (!raw || fread(raw, 1, (size_t)fsize, f) != (size_t)fsize) {
-        fprintf(stderr, "fixture read failed\n");
-        fclose(f);
-        return 1;
+        fprintf(stderr, "fixture read failed: %s\n", path);
+        exit(1);
     }
     fclose(f);
     raw[fsize] = '\0';
@@ -123,9 +126,148 @@ int main(int argc, char **argv)
     cJSON *v = cJSON_Parse(raw);
     free(raw);
     if (!v) {
-        fprintf(stderr, "fixture JSON parse failed\n");
+        fprintf(stderr, "fixture JSON parse failed: %s\n", path);
+        exit(1);
+    }
+    return v;
+}
+
+static const cJSON *obj_field(const cJSON *obj, const char *key)
+{
+    const cJSON *item = cJSON_GetObjectItemCaseSensitive(obj, key);
+    if (!cJSON_IsObject(item)) {
+        fprintf(stderr, "missing object field %s\n", key);
+        exit(1);
+    }
+    return item;
+}
+
+static unsigned char *domain_input(const char *domain, const unsigned char hash[32], size_t *len_out)
+{
+    size_t domain_len = strlen(domain);
+    unsigned char *input = malloc(domain_len + 32);
+    if (!input) {
+        fprintf(stderr, "oom building signing input\n");
+        exit(1);
+    }
+    memcpy(input, domain, domain_len);
+    memcpy(input + domain_len, hash, 32);
+    *len_out = domain_len + 32;
+    return input;
+}
+
+static int mldsa_verifies(OQS_SIG *alg, const unsigned char *msg, size_t msg_len,
+                          const unsigned char *sig, size_t sig_len, const unsigned char *pk)
+{
+    return OQS_SIG_verify(alg, msg, msg_len, sig, sig_len, pk) == OQS_SUCCESS;
+}
+
+static void check_file_signature_vector(const char *path)
+{
+    cJSON *v = load_fixture(path);
+    check(strcmp(str_field(v, "vector_kind"), "file_signature_v1") == 0,
+          "file_signature_v1 vector_kind");
+
+    const cJSON *domains = obj_field(v, "domains");
+    const char *tee_domain = str_field(domains, "tee");
+    const char *owner_domain = str_field(domains, "owner");
+    check(strcmp(tee_domain, TEE_SIGNATURE_DOMAIN) == 0,
+          "TEE_SIGNATURE_DOMAIN equals the vector's tee domain");
+
+    size_t ct_len = 0;
+    unsigned char *ct = b64_field(v, "ciphertext_b64", &ct_len);
+    unsigned char hash[32];
+    crypto_hash_sha256(hash, ct, ct_len);
+    unsigned char want_hash[32];
+    size_t want_len = 0;
+    const char *want_hex = str_field(v, "ciphertext_sha256_hex");
+    check(sodium_hex2bin(want_hash, sizeof(want_hash), want_hex, strlen(want_hex),
+                         NULL, &want_len, NULL) == 0
+              && want_len == 32 && memcmp(hash, want_hash, 32) == 0,
+          "sha256 of the vector ciphertext equals ciphertext_sha256_hex");
+
+    size_t tee_input_len = 0, owner_input_len = 0;
+    unsigned char *tee_input = domain_input(tee_domain, hash, &tee_input_len);
+    unsigned char *owner_input = domain_input(owner_domain, hash, &owner_input_len);
+
+    OQS_SIG *mldsa = OQS_SIG_new(OQS_SIG_alg_ml_dsa_44);
+    if (!mldsa) {
+        fprintf(stderr, "liboqs has no ML-DSA-44\n");
+        exit(1);
+    }
+
+    const cJSON *pub = obj_field(v, "signing_pub");
+    const cJSON *tee = obj_field(v, "tee");
+    size_t pub_ed_len = 0, pub_ml_len = 0, sig_ed_len = 0, sig_ml_len = 0;
+    unsigned char *pub_ed = b64_field(pub, "ed25519_b64", &pub_ed_len);
+    unsigned char *pub_ml = b64_field(pub, "mldsa44_b64", &pub_ml_len);
+    unsigned char *sig_ed = b64_field(tee, "sig_ed25519_b64", &sig_ed_len);
+    unsigned char *sig_ml = b64_field(tee, "sig_mldsa44_b64", &sig_ml_len);
+    check(pub_ed_len == E2EE_ED25519_PK_SIZE && pub_ml_len == MLDSA44_PUBLIC_KEY_SIZE
+              && sig_ed_len == E2EE_ED25519_SIG_SIZE && sig_ml_len == MLDSA44_SIGNATURE_SIZE,
+          "file_signature_v1 field sizes");
+    check(crypto_sign_verify_detached(sig_ed, tee_input, tee_input_len, pub_ed) == 0
+              && mldsa_verifies(mldsa, tee_input, tee_input_len, sig_ml, sig_ml_len, pub_ml),
+          "the Go-signed tee pair verifies over the vector's domain || sha256(ct)");
+
+    unsigned char ed_pk[crypto_sign_PUBLICKEYBYTES];
+    unsigned char ed_sk[crypto_sign_SECRETKEYBYTES];
+    crypto_sign_keypair(ed_pk, ed_sk);
+    unsigned char *ml_pk = malloc(mldsa->length_public_key);
+    unsigned char *ml_sk = malloc(mldsa->length_secret_key);
+    if (!ml_pk || !ml_sk || OQS_SIG_keypair(mldsa, ml_pk, ml_sk) != OQS_SUCCESS) {
+        fprintf(stderr, "ML-DSA-44 keypair failed\n");
+        exit(1);
+    }
+
+    unsigned char out_ed[E2EE_ED25519_SIG_SIZE];
+    unsigned char out_ml[MLDSA44_SIGNATURE_SIZE];
+    int rc = tee_sign_hash(hash, ed_sk, ml_sk, out_ed, out_ml);
+    check(rc == 0, "tee_sign_hash signs the vector ciphertext hash");
+    check(rc == 0 && crypto_sign_verify_detached(out_ed, tee_input, tee_input_len, ed_pk) == 0,
+          "tee_sign_hash Ed25519 verifies over the vector's tee-domain input");
+    check(rc == 0 && mldsa_verifies(mldsa, tee_input, tee_input_len, out_ml, sizeof(out_ml), ml_pk),
+          "tee_sign_hash ML-DSA-44 verifies over the vector's tee-domain input");
+    check(rc == 0 && crypto_sign_verify_detached(out_ed, owner_input, owner_input_len, ed_pk) != 0
+              && !mldsa_verifies(mldsa, owner_input, owner_input_len, out_ml, sizeof(out_ml), ml_pk),
+          "an enclave signature does not verify under the owner domain");
+
+    unsigned char other_hash[32];
+    memcpy(other_hash, hash, 32);
+    other_hash[0] ^= 0x01;
+    size_t other_len = 0;
+    unsigned char *other_input = domain_input(tee_domain, other_hash, &other_len);
+    check(rc == 0 && crypto_sign_verify_detached(out_ed, other_input, other_len, ed_pk) != 0
+              && !mldsa_verifies(mldsa, other_input, other_len, out_ml, sizeof(out_ml), ml_pk),
+          "an enclave signature does not verify over a different ciphertext hash");
+
+    sodium_memzero(ed_sk, sizeof(ed_sk));
+    OQS_MEM_secure_free(ml_sk, mldsa->length_secret_key);
+    free(ml_pk);
+    OQS_SIG_free(mldsa);
+    free(other_input);
+    free(tee_input);
+    free(owner_input);
+    free(pub_ed);
+    free(pub_ml);
+    free(sig_ed);
+    free(sig_ml);
+    free(ct);
+    cJSON_Delete(v);
+}
+
+int main(int argc, char **argv)
+{
+    if (argc != 3) {
+        fprintf(stderr, "usage: %s <chunked_file_v1.json> <file_signature_v1.json>\n", argv[0]);
         return 1;
     }
+    if (sodium_init() < 0) {
+        fprintf(stderr, "sodium_init failed\n");
+        return 1;
+    }
+
+    cJSON *v = load_fixture(argv[1]);
 
     check(strcmp(str_field(v, "vector_kind"), "chunked_file_v1") == 0, "vector_kind");
 
@@ -168,7 +310,7 @@ int main(int argc, char **argv)
 
     check(chunk_size == E2EE_CHUNK_SIZE, "fixture chunk_size matches E2EE_CHUNK_SIZE");
 
-    char ct_path[64];
+    char ct_path[512];
     write_temp(ciphertext, ct_len, ct_path, sizeof(ct_path));
     unsigned char *plaintext = NULL;
     size_t plaintext_len = 0;
@@ -230,8 +372,8 @@ int main(int argc, char **argv)
         for (size_t i = 0; i < sizeof(sample); i++) {
             sample[i] = (unsigned char)(i * 7 + 1);
         }
-        char enc_path[64];
-        snprintf(enc_path, sizeof(enc_path), "/tmp/pigcloud-vector-enc-XXXXXX");
+        char enc_path[512];
+        temp_template(enc_path, sizeof(enc_path), "pigcloud-vector-enc");
         int efd = mkstemp(enc_path);
         check(efd >= 0, "mkstemp for encrypt output");
         if (efd >= 0) {
@@ -357,6 +499,8 @@ int main(int argc, char **argv)
     free(ciphertext);
     free(nonce);
     cJSON_Delete(v);
+
+    check_file_signature_vector(argv[2]);
 
     if (g_failures > 0) {
         fprintf(stderr, "%d conformance check(s) failed\n", g_failures);
