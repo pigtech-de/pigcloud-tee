@@ -7,8 +7,13 @@
 #include "protocol.h"
 #include "vendor/cjson/cJSON.h"
 
-#define WORKER_POOL_SIZE 4
+#define WORKER_POOL_SIZE 8
 #define WORK_QUEUE_CAPACITY 64
+
+#define TEE_LISTEN_BACKLOG 256
+
+#define SIGNER_POOL_SIZE 4
+#define TEE_SIGNER_LISTEN_BACKLOG 64
 
 #define TEE_MEMORYMAX_BYTES        (32ULL * 1024 * 1024 * 1024)
 #define TEE_SCAN_MEM_BUDGET_BYTES  (TEE_MEMORYMAX_BYTES / 2)
@@ -69,6 +74,17 @@ int tee_submitter_table_used(tee_submitter_table_t *t);
 cJSON *tee_admission_busy_response(void);
 
 cJSON *tee_admission_user_busy_response(void);
+
+#define TEE_FASTPATH_MAX_MSG 128
+
+typedef enum {
+    TEE_ROUTE_QUEUE = 0,
+    TEE_ROUTE_HEALTH,
+    TEE_ROUTE_METRICS,
+    TEE_ROUTE_CONTROL,
+} tee_route_t;
+
+tee_route_t tee_route_small_request(const char *json);
 
 int tee_scan_past_deadline(const char *verdict, uint64_t elapsed_ms);
 

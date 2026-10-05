@@ -95,6 +95,27 @@ int tee_scan_past_deadline(const char *verdict, uint64_t elapsed_ms)
     return elapsed_ms > (uint64_t)TEE_SCAN_WALL_CAP_SECS * 1000u;
 }
 
+tee_route_t tee_route_small_request(const char *json)
+{
+    cJSON *msg = cJSON_Parse(json);
+    if (!msg) {
+        return TEE_ROUTE_QUEUE;
+    }
+    const cJSON *op = cJSON_GetObjectItemCaseSensitive(msg, "op");
+    tee_route_t route = TEE_ROUTE_QUEUE;
+    if (cJSON_IsString(op)) {
+        if (strcmp(op->valuestring, OP_HEALTH) == 0) {
+            route = TEE_ROUTE_HEALTH;
+        } else if (strcmp(op->valuestring, OP_METRICS) == 0) {
+            route = TEE_ROUTE_METRICS;
+        } else if (strcmp(op->valuestring, OP_ATTESTATION) == 0) {
+            route = TEE_ROUTE_CONTROL;
+        }
+    }
+    cJSON_Delete(msg);
+    return route;
+}
+
 static cJSON *busy_response_with_reason(const char *reason)
 {
     cJSON *resp = cJSON_CreateObject();

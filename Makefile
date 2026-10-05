@@ -205,9 +205,13 @@ tests/image_anim_test: tests/image_anim_test.c sanitizers/image.c sanitizers/san
 	$(CC) $(CFLAGS) -o $@ tests/image_anim_test.c $(WHITELIST_C) -lgd
 
 tests/admission_harness: tests/admission_harness.c admission.c admission.h protocol.h \
-                         deploy/monitor-cron.sh vendor/cjson/cJSON.c vendor/cjson/cJSON.h
+                         deploy/monitor-cron.sh systemd/pigcloud-tee-scanner.socket \
+                         systemd/pigcloud-tee-signer.socket \
+                         vendor/cjson/cJSON.c vendor/cjson/cJSON.h
 	$(CC) -O2 -Wall -Wextra -std=c11 -pthread \
 		-DTEE_MONITOR_CRON='"$(CURDIR)/deploy/monitor-cron.sh"' \
+		-DTEE_SCANNER_SOCKET_UNIT='"$(CURDIR)/systemd/pigcloud-tee-scanner.socket"' \
+		-DTEE_SIGNER_SOCKET_UNIT='"$(CURDIR)/systemd/pigcloud-tee-signer.socket"' \
 		-o $@ tests/admission_harness.c admission.c vendor/cjson/cJSON.c
 
 SGX_SIGN_KEY ?= enclave_signing_key.pem

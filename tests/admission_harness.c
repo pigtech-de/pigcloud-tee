@@ -241,30 +241,77 @@ static void test_busy_reply_shape(void)
     cJSON_Delete(busy);
 }
 
-static void test_monitor_cron_pool_size(void)
+static long read_key_value(const char *path, const char *key)
 {
-    printf("(f) monitor-cron.sh POOL_SIZE tracks WORKER_POOL_SIZE\n");
-    FILE *f = fopen(TEE_MONITOR_CRON, "r");
+    FILE *f = fopen(path, "r");
     if (!f) {
-        printf("      could not open %s\n", TEE_MONITOR_CRON);
-        check("monitor-cron.sh readable", 0);
-        return;
+        printf("      could not open %s\n", path);
+        return -1;
     }
+    size_t key_len = strlen(key);
     char line[512];
     long found = -1;
     while (fgets(line, sizeof line, f)) {
-        if (strncmp(line, "POOL_SIZE=", 10) == 0) {
-            found = strtol(line + 10, NULL, 10);
+        if (strncmp(line, key, key_len) == 0) {
+            found = strtol(line + key_len, NULL, 10);
             break;
         }
     }
     fclose(f);
+    return found;
+}
+
+static int file_has_line(const char *path, const char *want)
+{
+    FILE *f = fopen(path, "r");
+    if (!f) {
+        return 0;
+    }
+    char line[512];
+    int found = 0;
+    while (!found && fgets(line, sizeof line, f)) {
+        line[strcspn(line, "\r\n")] = '\0';
+        found = strcmp(line, want) == 0;
+    }
+    fclose(f);
+    return found;
+}
+
+static void test_monitor_cron_pool_size(void)
+{
+    printf("(f) monitor-cron.sh POOL_SIZE tracks WORKER_POOL_SIZE\n");
+    long found = read_key_value(TEE_MONITOR_CRON, "POOL_SIZE=");
     if (found < 0) {
         check("monitor-cron.sh declares POOL_SIZE", 0);
         return;
     }
     printf("      script POOL_SIZE=%ld, WORKER_POOL_SIZE=%d\n", found, WORKER_POOL_SIZE);
     check("POOL_SIZE equals WORKER_POOL_SIZE", found == WORKER_POOL_SIZE);
+}
+
+static void test_socket_unit_backlog(void)
+{
+    printf("(l) scanner.socket Backlog= tracks TEE_LISTEN_BACKLOG\n");
+    long found = read_key_value(TEE_SCANNER_SOCKET_UNIT, "Backlog=");
+    if (found < 0) {
+        check("pigcloud-tee-scanner.socket declares Backlog=", 0);
+        return;
+    }
+    printf("      unit Backlog=%ld, TEE_LISTEN_BACKLOG=%d\n", found, TEE_LISTEN_BACKLOG);
+    check("Backlog= equals TEE_LISTEN_BACKLOG", found == TEE_LISTEN_BACKLOG);
+    check("the backlog outlasts the handoff queue",
+          TEE_LISTEN_BACKLOG >= WORK_QUEUE_CAPACITY);
+    check("the submitter table holds every worker's submitter",
+          TEE_SUBMITTER_TABLE_SIZE >= WORKER_POOL_SIZE);
+
+    long signer = read_key_value(TEE_SIGNER_SOCKET_UNIT, "Backlog=");
+    printf("      signer unit Backlog=%ld, TEE_SIGNER_LISTEN_BACKLOG=%d\n", signer, TEE_SIGNER_LISTEN_BACKLOG);
+    check("signer Backlog= equals TEE_SIGNER_LISTEN_BACKLOG", signer == TEE_SIGNER_LISTEN_BACKLOG);
+    check("the signer backlog holds every scanner worker plus the control thread",
+          TEE_SIGNER_LISTEN_BACKLOG >= WORKER_POOL_SIZE + 1);
+    check("both socket units keep the shared runtime directory on stop",
+          file_has_line(TEE_SCANNER_SOCKET_UNIT, "RuntimeDirectoryPreserve=yes")
+          && file_has_line(TEE_SIGNER_SOCKET_UNIT, "RuntimeDirectoryPreserve=yes"));
 }
 
 static void test_deadline_rejected_wins(void)
@@ -400,12 +447,18 @@ static void test_fair_share_under_load(void)
     const int hog_jobs = 240;
     const int victim_jobs = 20;
     int id = 0;
+    int victim_pushed = 0;
     for (int i = 0; i < hog_jobs; i++, id++) {
         g_job_user[id] = 1;
         while (tee_queue_try_push(&q, id) != 0) {
             usleep(100);
         }
         if (i % 12 == 11 && id + 1 < MAX_JOBS && (i / 12) < victim_jobs) {
+            while (victim_pushed - atomic_load(&g_user_done[2]) - atomic_load(&g_user_shed[2])
+                   >= TEE_MAX_INFLIGHT_SCANS_PER_USER) {
+                usleep(100);
+            }
+            victim_pushed++;
             id++;
             g_job_user[id] = 2;
             while (tee_queue_try_push(&q, id) != 0) {
@@ -462,6 +515,36 @@ static void test_user_busy_reply_shape(void)
     cJSON_Delete(busy);
 }
 
+static void test_small_request_routing(void)
+{
+    printf("(m) get_attestation bypasses the scan queue, scans never do\n");
+    const char *attest = "{\"op\":\"get_attestation\","
+                         "\"nonce\":\"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=\"}";
+    check("an attestation request with its nonce fits the fast-path peek",
+          strlen(attest) <= TEE_FASTPATH_MAX_MSG);
+    check("get_attestation routes to the control thread",
+          tee_route_small_request(attest) == TEE_ROUTE_CONTROL);
+    check("health is answered on the accept thread",
+          tee_route_small_request("{\"op\":\"health\"}") == TEE_ROUTE_HEALTH);
+    check("metrics is answered on the accept thread",
+          tee_route_small_request("{\"op\":\"metrics\"}") == TEE_ROUTE_METRICS);
+    check("a scan op queues", tee_route_small_request("{\"op\":\"scan\"}") == TEE_ROUTE_QUEUE);
+    check("an unknown op queues", tee_route_small_request("{\"op\":\"sign\"}") == TEE_ROUTE_QUEUE);
+    check("unparseable bytes queue", tee_route_small_request("{\"op\":") == TEE_ROUTE_QUEUE);
+
+    char sealed[4 * ((HYBRID_SEALED_DATA_KEY_SIZE + 2) / 3) + 1];
+    memset(sealed, 'A', sizeof(sealed) - 1);
+    sealed[sizeof(sealed) - 1] = '\0';
+    cJSON *scan = cJSON_CreateObject();
+    cJSON_AddStringToObject(scan, "op", OP_SCAN);
+    cJSON_AddStringToObject(scan, "tee_sealed_key", sealed);
+    char *json = cJSON_PrintUnformatted(scan);
+    check("every scan request is longer than the peek, so none leaves the queue",
+          json != NULL && strlen(json) > TEE_FASTPATH_MAX_MSG);
+    free(json);
+    cJSON_Delete(scan);
+}
+
 int main(void)
 {
     printf("SCALE-21 admission-control harness "
@@ -480,6 +563,8 @@ int main(void)
     test_submitter_table_bound();
     test_fair_share_under_load();
     test_user_busy_reply_shape();
+    test_socket_unit_backlog();
+    test_small_request_routing();
     printf("\n%s (%d failure%s)\n", g_failures ? "FAILED" : "ALL PASSED",
            g_failures, g_failures == 1 ? "" : "s");
     return g_failures ? 1 : 0;

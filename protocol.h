@@ -39,6 +39,8 @@
 
 #define REASON_SCANNER_USER_BUSY "scanner_user_busy"
 
+#define REASON_SEALED_KEY_STALE  "sealed_key_stale"
+
 #define E2EE_CHUNK_SIZE       (1024 * 1024)
 #define E2EE_KEY_SIZE         32
 #define E2EE_NONCE_SIZE       24

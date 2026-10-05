@@ -87,6 +87,8 @@ static void audit_sighup_handler(int sig)
 
 static work_queue_t g_queue;
 static pthread_t g_workers[WORKER_POOL_SIZE];
+static work_queue_t g_control_queue;
+static pthread_t g_control_worker;
 
 static int recv_exact(int fd, void *buf, size_t n)
 {
@@ -787,7 +789,8 @@ static int handle_scan(int fd, cJSON *json)
             unseal_reason, sizeof(unseal_reason)) != 0) {
         fprintf(stderr, "WARN: scan unseal failed: %s (sealed_len=%zu)\n",
                 unseal_reason, req.tee_sealed_key_len);
-        fail_reason = "unseal_failed";
+        fail_reason = strcmp(unseal_reason, "signer_rejected:" TEE_UNSEAL_REASON_AEAD_AUTH) == 0
+            ? REASON_SEALED_KEY_STALE : "unseal_failed";
         goto scan_failed;
     }
 
@@ -1120,9 +1123,11 @@ static void handle_connection(int client_fd)
     cJSON_Delete(msg);
 }
 
-#define FASTPATH_MAX_MSG        64
+#define FASTPATH_MAX_MSG        TEE_FASTPATH_MAX_MSG
 #define FASTPATH_WAIT_MS        1000
 #define FASTPATH_POLL_SLICE_MS  20
+
+enum { FASTPATH_QUEUE = 0, FASTPATH_ANSWERED = 1, FASTPATH_CONTROL = 2 };
 
 static int fastpath_control_op(int fd)
 {
@@ -1143,7 +1148,7 @@ static int fastpath_control_op(int fd)
                     | ((uint32_t)buf[2] <<  8)
                     | ((uint32_t)buf[3]);
             if (msg_len == 0 || msg_len > FASTPATH_MAX_MSG) {
-                return 0;
+                return FASTPATH_QUEUE;
             }
             if ((size_t)got >= 4 + (size_t)msg_len) {
                 break;
@@ -1163,28 +1168,37 @@ static int fastpath_control_op(int fd)
     }
 
     buf[4 + msg_len] = '\0';
-    cJSON *msg = cJSON_Parse((const char *)buf + 4);
-    if (!msg) {
-        return 0;
+    tee_route_t route = tee_route_small_request((const char *)buf + 4);
+    if (route == TEE_ROUTE_CONTROL) {
+        return FASTPATH_CONTROL;
     }
-    cJSON *op = cJSON_GetObjectItemCaseSensitive(msg, "op");
-    int is_health  = cJSON_IsString(op) && strcmp(op->valuestring, OP_HEALTH) == 0;
-    int is_metrics = cJSON_IsString(op) && strcmp(op->valuestring, OP_METRICS) == 0;
-    cJSON_Delete(msg);
-    if (!is_health && !is_metrics) {
-        return 0;
+    if (route != TEE_ROUTE_HEALTH && route != TEE_ROUTE_METRICS) {
+        return FASTPATH_QUEUE;
     }
 
     (void)recv(fd, buf, 4 + (size_t)msg_len, MSG_DONTWAIT);
 
     struct timeval tv = { .tv_sec = 2, .tv_usec = 0 };
     setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
-    if (is_health) {
+    if (route == TEE_ROUTE_HEALTH) {
         handle_health(fd);
     } else {
         handle_metrics(fd);
     }
-    return 1;
+    return FASTPATH_ANSWERED;
+}
+
+static void *control_worker_loop(void *arg)
+{
+    (void)arg;
+    for (;;) {
+        int fd = tee_queue_pop(&g_control_queue);
+        if (fd < 0) {
+            return NULL;
+        }
+        handle_connection(fd);
+        close(fd);
+    }
 }
 
 static void *worker_loop(void *arg)
@@ -1334,7 +1348,7 @@ static void *signer_worker_loop(void *arg)
     }
 }
 
-static int tee_listen_unix(const char *socket_path, int *activated_out)
+static int tee_listen_unix(const char *socket_path, int backlog, int *activated_out)
 {
     int server_fd = -1;
     *activated_out = 0;
@@ -1350,6 +1364,9 @@ static int tee_listen_unix(const char *socket_path, int *activated_out)
         server_fd = SD_LISTEN_FDS_START;
         *activated_out = 1;
         fprintf(stderr, "INFO: using socket-activated fd %d\n", server_fd);
+        if (listen(server_fd, backlog) < 0) {
+            perror("listen (socket-activated backlog)");
+        }
     }
 #endif
 
@@ -1375,7 +1392,7 @@ static int tee_listen_unix(const char *socket_path, int *activated_out)
 
         chmod(socket_path, 0660);
 
-        if (listen(server_fd, 64) < 0) {
+        if (listen(server_fd, backlog) < 0) {
             perror("listen");
             close(server_fd);
             unlink(socket_path);
@@ -1432,12 +1449,12 @@ static int tee_accept_gated(int server_fd, struct pollfd *pfd, const char *role)
     return client_fd;
 }
 
-static int tee_start_workers(pthread_t *workers, void *(*loop)(void *),
+static int tee_start_workers(pthread_t *workers, int count, void *(*loop)(void *),
                              const char *role)
 {
     tee_queue_init(&g_queue);
     tee_submitter_table_init(&g_submitters);
-    for (int i = 0; i < WORKER_POOL_SIZE; i++) {
+    for (int i = 0; i < count; i++) {
         if (pthread_create(&workers[i], NULL, loop, NULL) != 0) {
             fprintf(stderr, "FATAL: pthread_create %s worker %d failed\n", role, i);
             return -1;
@@ -1471,7 +1488,7 @@ static int run_signer(const char *socket_path)
     signal(SIGPIPE, SIG_IGN);
 
     int socket_activated = 0;
-    int server_fd = tee_listen_unix(socket_path, &socket_activated);
+    int server_fd = tee_listen_unix(socket_path, TEE_SIGNER_LISTEN_BACKLOG, &socket_activated);
     if (server_fd < 0) {
         attestation_destroy();
         return 1;
@@ -1479,14 +1496,14 @@ static int run_signer(const char *socket_path)
 
     g_start_time = time(NULL);
     fprintf(stderr, "INFO: signer listening on %s%s (workers=%d)\n", socket_path,
-            socket_activated ? " (socket-activated)" : "", WORKER_POOL_SIZE);
+            socket_activated ? " (socket-activated)" : "", SIGNER_POOL_SIZE);
 
     if (pigcloud_seccomp_install(1) != 0) {
         return 1;
     }
 
-    pthread_t workers[WORKER_POOL_SIZE];
-    if (tee_start_workers(workers, signer_worker_loop, "signer") != 0) {
+    pthread_t workers[SIGNER_POOL_SIZE];
+    if (tee_start_workers(workers, SIGNER_POOL_SIZE, signer_worker_loop, "signer") != 0) {
         return 1;
     }
 
@@ -1506,7 +1523,7 @@ static int run_signer(const char *socket_path)
     }
 
     tee_queue_shutdown(&g_queue);
-    for (int i = 0; i < WORKER_POOL_SIZE; i++) {
+    for (int i = 0; i < SIGNER_POOL_SIZE; i++) {
         pthread_join(workers[i], NULL);
     }
 
@@ -1651,7 +1668,7 @@ int main(int argc, char *argv[])
     sigaction(SIGHUP, &sa_hup, NULL);
 
     int socket_activated = 0;
-    int server_fd = tee_listen_unix(socket_path, &socket_activated);
+    int server_fd = tee_listen_unix(socket_path, TEE_LISTEN_BACKLOG, &socket_activated);
     if (server_fd < 0) {
         scanner_destroy();
         attestation_destroy();
@@ -1667,7 +1684,12 @@ int main(int argc, char *argv[])
         return 1;
     }
 
-    if (tee_start_workers(g_workers, worker_loop, "scanner") != 0) {
+    if (tee_start_workers(g_workers, WORKER_POOL_SIZE, worker_loop, "scanner") != 0) {
+        return 1;
+    }
+    tee_queue_init(&g_control_queue);
+    if (pthread_create(&g_control_worker, NULL, control_worker_loop, NULL) != 0) {
+        fprintf(stderr, "FATAL: pthread_create scanner control worker failed\n");
         return 1;
     }
 
@@ -1685,12 +1707,14 @@ int main(int argc, char *argv[])
             continue;
         }
 
-        if (fastpath_control_op(client_fd)) {
+        int fast = fastpath_control_op(client_fd);
+        if (fast == FASTPATH_ANSWERED) {
             close(client_fd);
             continue;
         }
+        work_queue_t *dest = fast == FASTPATH_CONTROL ? &g_control_queue : &g_queue;
 
-        if (tee_queue_try_push(&g_queue, client_fd) != 0) {
+        if (tee_queue_try_push(dest, client_fd) != 0) {
             struct timeval bt = { .tv_sec = 2, .tv_usec = 0 };
             setsockopt(client_fd, SOL_SOCKET, SO_SNDTIMEO, &bt, sizeof(bt));
             send_busy(client_fd);
@@ -1700,9 +1724,11 @@ int main(int argc, char *argv[])
     }
 
     tee_queue_shutdown(&g_queue);
+    tee_queue_shutdown(&g_control_queue);
     for (int i = 0; i < WORKER_POOL_SIZE; i++) {
         pthread_join(g_workers[i], NULL);
     }
+    pthread_join(g_control_worker, NULL);
 
     fprintf(stderr,
             "INFO: shutting down — scans=%lu (clean=%lu sanitized=%lu rejected=%lu errored=%lu clamav=%lu) inflight=%d\n",

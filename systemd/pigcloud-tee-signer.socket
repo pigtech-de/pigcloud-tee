@@ -5,6 +5,7 @@ Description=PigCloud TEE Signer Socket
 ListenStream=/run/pigcloud-tee/signer.sock
 RuntimeDirectory=pigcloud-tee
 RuntimeDirectoryMode=0750
+RuntimeDirectoryPreserve=yes
 SocketUser=pigcloud-tee-signer
 SocketGroup=www-data
 SocketMode=0660
