@@ -8,7 +8,6 @@
 #include <errno.h>
 #include <sys/stat.h>
 #include <time.h>
-#include <pthread.h>
 #include <sodium.h>
 #include <oqs/oqs.h>
 
@@ -32,20 +31,6 @@
                             + MLDSA44_PUBLIC_KEY_SIZE \
                             + MLDSA44_SECRET_KEY_SIZE)
 
-#define SGX_QUOTE_HEADER_SIZE    48
-#define SGX_REPORT_BODY_OFFSET   48
-#define SGX_MRENCLAVE_OFFSET     (SGX_REPORT_BODY_OFFSET + 64)
-#define SGX_MRENCLAVE_SIZE       32
-#define SGX_REPORT_DATA_OFFSET   (SGX_REPORT_BODY_OFFSET + 320)
-#define SGX_REPORT_DATA_SIZE     64
-#define SGX_MIN_QUOTE_SIZE       (SGX_REPORT_DATA_OFFSET + SGX_REPORT_DATA_SIZE)
-
-#define GRAMINE_ATTEST_TYPE      "/dev/attestation/attestation_type"
-#define GRAMINE_USER_REPORT_DATA "/dev/attestation/user_report_data"
-#define GRAMINE_QUOTE            "/dev/attestation/quote"
-
-#define MAX_QUOTE_SIZE 8192
-
 static unsigned char s_pk[crypto_box_PUBLICKEYBYTES];
 static unsigned char s_sk[crypto_box_SECRETKEYBYTES];
 static unsigned char s_kyber_pk[KYBER_PUBLIC_KEY_SIZE];
@@ -54,20 +39,9 @@ static unsigned char s_ed25519_pk[crypto_sign_PUBLICKEYBYTES];
 static unsigned char s_ed25519_sk[crypto_sign_SECRETKEYBYTES];
 static unsigned char s_mldsa_pk[MLDSA44_PUBLIC_KEY_SIZE];
 static unsigned char s_mldsa_sk[MLDSA44_SECRET_KEY_SIZE];
-static attest_mode_t s_mode = ATTEST_MODE_NONE;
 static int s_initialized = 0;
 
-static unsigned char *s_quote = NULL;
-static size_t s_quote_len = 0;
-static char *s_quote_b64 = NULL;
-static char s_mrenclave_hex[SHA256_HEX_BUF] = {0};
-static time_t s_quote_generated_at = 0;
-
 static uint64_t s_epoch = 0;
-
-#define ATTESTATION_QUOTE_TTL_SECONDS (6 * 3600)
-
-static pthread_mutex_t s_quote_lock = PTHREAD_MUTEX_INITIALIZER;
 
 static unsigned char s_keypair_kek[crypto_aead_xchacha20poly1305_ietf_KEYBYTES];
 static int s_have_kek = 0;
@@ -250,167 +224,6 @@ static int save_keypair_to_disk(void)
     return 0;
 }
 
-static ssize_t read_pseudo_file(const char *path, void *buf, size_t buf_size)
-{
-    int fd = open(path, O_RDONLY);
-    if (fd < 0) return -1;
-
-    ssize_t total = 0;
-    while ((size_t)total < buf_size) {
-        ssize_t n = read(fd, (char *)buf + total, buf_size - (size_t)total);
-        if (n < 0) { close(fd); return -1; }
-        if (n == 0) break;
-        total += n;
-    }
-    close(fd);
-    return total;
-}
-
-static int write_pseudo_file(const char *path, const void *buf, size_t n)
-{
-    int fd = open(path, O_WRONLY);
-    if (fd < 0) return -1;
-
-    ssize_t written = write(fd, buf, n);
-    close(fd);
-    return (written == (ssize_t)n) ? 0 : -1;
-}
-
-static attest_mode_t detect_sgx(void)
-{
-    char type_buf[32] = {0};
-    ssize_t n = read_pseudo_file(GRAMINE_ATTEST_TYPE, type_buf, sizeof(type_buf) - 1);
-    if (n <= 0) return ATTEST_MODE_NONE;
-
-    for (ssize_t i = n - 1; i >= 0 && (type_buf[i] == '\n' || type_buf[i] == ' '); i--) {
-        type_buf[i] = '\0';
-    }
-
-    if (strcmp(type_buf, "epid") == 0) {
-        return ATTEST_MODE_EPID;
-    }
-    return ATTEST_MODE_NONE;
-}
-
-static void compute_hybrid_report_data(unsigned char out[SGX_REPORT_DATA_SIZE],
-                                       const unsigned char *nonce)
-{
-    crypto_hash_sha256_state state;
-    crypto_hash_sha256_init(&state);
-    crypto_hash_sha256_update(&state, s_pk, sizeof(s_pk));
-    crypto_hash_sha256_update(&state, s_kyber_pk, KYBER_PUBLIC_KEY_SIZE);
-    crypto_hash_sha256_update(&state, s_ed25519_pk, sizeof(s_ed25519_pk));
-    crypto_hash_sha256_update(&state, s_mldsa_pk, MLDSA44_PUBLIC_KEY_SIZE);
-
-    memset(out, 0, SGX_REPORT_DATA_SIZE);
-    crypto_hash_sha256_final(&state, out);
-
-    if (nonce) {
-        memcpy(out + crypto_hash_sha256_BYTES, nonce, TEE_ATTEST_NONCE_SIZE);
-    }
-}
-
-static int produce_quote_locked(const unsigned char report_data[SGX_REPORT_DATA_SIZE],
-                                unsigned char *quote_buf, size_t quote_buf_size,
-                                ssize_t *quote_len_out)
-{
-    pthread_mutex_lock(&s_quote_lock);
-    if (write_pseudo_file(GRAMINE_USER_REPORT_DATA, report_data,
-                          SGX_REPORT_DATA_SIZE) != 0) {
-        pthread_mutex_unlock(&s_quote_lock);
-        return -1;
-    }
-    *quote_len_out = read_pseudo_file(GRAMINE_QUOTE, quote_buf, quote_buf_size);
-    pthread_mutex_unlock(&s_quote_lock);
-    return 0;
-}
-
-static int generate_sgx_quote(void)
-{
-    unsigned char report_data[SGX_REPORT_DATA_SIZE];
-    compute_hybrid_report_data(report_data, NULL);
-
-    unsigned char quote_buf[MAX_QUOTE_SIZE];
-    ssize_t quote_len = -1;
-    if (produce_quote_locked(report_data, quote_buf, sizeof(quote_buf),
-                             &quote_len) != 0) {
-        fprintf(stderr, "WARNING: failed to write user_report_data\n");
-        return -1;
-    }
-    if (quote_len < (ssize_t)SGX_MIN_QUOTE_SIZE) {
-        fprintf(stderr, "WARNING: SGX quote too short (%zd bytes, need >= %d)\n",
-                quote_len, SGX_MIN_QUOTE_SIZE);
-        return -1;
-    }
-
-    unsigned char mrenclave[SGX_MRENCLAVE_SIZE];
-    memcpy(mrenclave, quote_buf + SGX_MRENCLAVE_OFFSET, SGX_MRENCLAVE_SIZE);
-    sodium_bin2hex(s_mrenclave_hex, sizeof(s_mrenclave_hex),
-                   mrenclave, SGX_MRENCLAVE_SIZE);
-
-    if (memcmp(report_data, quote_buf + SGX_REPORT_DATA_OFFSET, 32) != 0) {
-        fprintf(stderr, "WARNING: quote report_data does not match hybrid PK hash\n");
-        return -1;
-    }
-
-    s_quote = malloc((size_t)quote_len);
-    if (!s_quote) return -1;
-    memcpy(s_quote, quote_buf, (size_t)quote_len);
-    s_quote_len = (size_t)quote_len;
-
-    free(s_quote_b64);
-    size_t b64_maxlen = sodium_base64_ENCODED_LEN(s_quote_len,
-                            sodium_base64_VARIANT_ORIGINAL);
-    s_quote_b64 = malloc(b64_maxlen);
-    if (s_quote_b64) {
-        sodium_bin2base64(s_quote_b64, b64_maxlen,
-                          s_quote, s_quote_len,
-                          sodium_base64_VARIANT_ORIGINAL);
-    }
-
-    s_quote_generated_at = time(NULL);
-
-    fprintf(stderr, "INFO: SGX quote generated (%zd bytes), MRENCLAVE=%s\n",
-            quote_len, s_mrenclave_hex);
-    return 0;
-}
-
-static int generate_challenged_quote(const unsigned char nonce[TEE_ATTEST_NONCE_SIZE],
-                                     char **quote_b64_out,
-                                     char mrenclave_hex_out[SHA256_HEX_BUF])
-{
-    unsigned char report_data[SGX_REPORT_DATA_SIZE];
-    compute_hybrid_report_data(report_data, nonce);
-
-    unsigned char quote_buf[MAX_QUOTE_SIZE];
-    ssize_t quote_len = -1;
-    if (produce_quote_locked(report_data, quote_buf, sizeof(quote_buf),
-                             &quote_len) != 0
-        || quote_len < (ssize_t)SGX_MIN_QUOTE_SIZE) {
-        return -1;
-    }
-
-    if (memcmp(report_data, quote_buf + SGX_REPORT_DATA_OFFSET,
-               SGX_REPORT_DATA_SIZE) != 0) {
-        return -1;
-    }
-
-    unsigned char mrenclave[SGX_MRENCLAVE_SIZE];
-    memcpy(mrenclave, quote_buf + SGX_MRENCLAVE_OFFSET, SGX_MRENCLAVE_SIZE);
-    sodium_bin2hex(mrenclave_hex_out, 65, mrenclave, SGX_MRENCLAVE_SIZE);
-
-    size_t b64_maxlen = sodium_base64_ENCODED_LEN((size_t)quote_len,
-                            sodium_base64_VARIANT_ORIGINAL);
-    char *b64 = malloc(b64_maxlen);
-    if (!b64) {
-        return -1;
-    }
-    sodium_bin2base64(b64, b64_maxlen, quote_buf, (size_t)quote_len,
-                      sodium_base64_VARIANT_ORIGINAL);
-    *quote_b64_out = b64;
-    return 0;
-}
-
 static int generate_hybrid_keypair(void)
 {
     if (crypto_box_keypair(s_pk, s_sk) != 0) {
@@ -482,19 +295,11 @@ int attestation_init(void)
 
     load_keypair_kek();
 
-    attest_mode_t detected = detect_sgx();
-
-    int loaded = 0;
-    if (detected != ATTEST_MODE_EPID) {
-        if (load_keypair_from_disk() == 0) {
-            loaded = 1;
-            fprintf(stderr, "INFO: loaded persisted hybrid enclave keypair from %s\n",
-                    KEYPAIR_FILE);
-        }
-    }
-
-    if (!loaded) {
-        if (detected != ATTEST_MODE_EPID && access(KEYPAIR_FILE, F_OK) == 0) {
+    if (load_keypair_from_disk() == 0) {
+        fprintf(stderr, "INFO: loaded persisted hybrid enclave keypair from %s\n",
+                KEYPAIR_FILE);
+    } else {
+        if (access(KEYPAIR_FILE, F_OK) == 0) {
             fprintf(stderr, "FATAL: keypair exists at %s but could not be loaded; "
                             "refusing to generate a new one and rotate the enclave PK\n",
                     KEYPAIR_FILE);
@@ -506,29 +311,15 @@ int attestation_init(void)
         if (generate_signing_keypair() != 0) {
             return -1;
         }
-        if (detected != ATTEST_MODE_EPID) {
-            if (save_keypair_to_disk() == 0) {
-                fprintf(stderr, "INFO: persisted new hybrid enclave keypair set to %s\n",
-                        KEYPAIR_FILE);
-            } else {
-                fprintf(stderr,
-                        "WARNING: keypair persistence failed (errno=%d): "
-                        "PKs will rotate on next restart\n",
-                        errno);
-            }
-        }
-    }
-
-    if (detected == ATTEST_MODE_EPID) {
-        if (generate_sgx_quote() == 0) {
-            s_mode = ATTEST_MODE_EPID;
+        if (save_keypair_to_disk() == 0) {
+            fprintf(stderr, "INFO: persisted new hybrid enclave keypair set to %s\n",
+                    KEYPAIR_FILE);
         } else {
-            fprintf(stderr, "WARNING: SGX detected but quote generation failed, "
-                            "falling back to ATTEST_MODE_NONE\n");
-            s_mode = ATTEST_MODE_NONE;
+            fprintf(stderr,
+                    "WARNING: keypair persistence failed (errno=%d): "
+                    "PKs will rotate on next restart\n",
+                    errno);
         }
-    } else {
-        s_mode = ATTEST_MODE_NONE;
     }
 
     sodium_mlock(s_sk, sizeof(s_sk));
@@ -545,21 +336,6 @@ int attestation_init(void)
 uint64_t attestation_get_epoch(void)
 {
     return s_epoch;
-}
-
-void attestation_maybe_refresh(void)
-{
-    if (s_mode != ATTEST_MODE_EPID) {
-        return;
-    }
-    if (time(NULL) - s_quote_generated_at < ATTESTATION_QUOTE_TTL_SECONDS) {
-        return;
-    }
-    fprintf(stderr, "INFO: refreshing SGX quote (age %lds exceeded TTL)\n",
-            (long)(time(NULL) - s_quote_generated_at));
-    if (generate_sgx_quote() != 0) {
-        fprintf(stderr, "WARN: SGX quote refresh failed, keeping previous\n");
-    }
 }
 
 const unsigned char *attestation_get_public_key(void)
@@ -602,12 +378,7 @@ const unsigned char *attestation_get_mldsa_secret_key(void)
     return s_mldsa_sk;
 }
 
-attest_mode_t attestation_get_mode(void)
-{
-    return s_mode;
-}
-
-int attestation_get_data(attestation_data_t *out, const unsigned char *nonce)
+int attestation_get_data(attestation_data_t *out)
 {
     if (!s_initialized) {
         return -1;
@@ -645,19 +416,6 @@ int attestation_get_data(attestation_data_t *out, const unsigned char *nonce)
                       s_mldsa_pk, MLDSA44_PUBLIC_KEY_SIZE,
                       sodium_base64_VARIANT_ORIGINAL);
 
-    if (s_mode == ATTEST_MODE_EPID) {
-        char *challenged_b64 = NULL;
-        char challenged_mre[SHA256_HEX_BUF] = {0};
-        if (nonce != NULL
-            && generate_challenged_quote(nonce, &challenged_b64, challenged_mre) == 0) {
-            out->sgx_quote_b64 = challenged_b64;
-            memcpy(out->mrenclave_hex, challenged_mre, sizeof(out->mrenclave_hex));
-        } else if (s_quote && s_quote_len > 0 && s_quote_b64) {
-            out->sgx_quote_b64 = strdup(s_quote_b64);
-            memcpy(out->mrenclave_hex, s_mrenclave_hex, sizeof(s_mrenclave_hex));
-        }
-    }
-
     return 0;
 }
 
@@ -668,16 +426,8 @@ void attestation_data_free(attestation_data_t *data)
     }
     free(data->enclave_pk_kyber_b64);
     free(data->enclave_pk_mldsa_b64);
-    free(data->sgx_quote_b64);
-    free(data->ias_report_b64);
-    free(data->ias_signature_b64);
-    free(data->ias_cert_chain);
     data->enclave_pk_kyber_b64 = NULL;
     data->enclave_pk_mldsa_b64 = NULL;
-    data->sgx_quote_b64 = NULL;
-    data->ias_report_b64 = NULL;
-    data->ias_signature_b64 = NULL;
-    data->ias_cert_chain = NULL;
 }
 
 void attestation_destroy(void)
@@ -694,10 +444,5 @@ void attestation_destroy(void)
         sodium_munlock(s_keypair_kek, sizeof(s_keypair_kek));
         s_have_kek = 0;
     }
-    free(s_quote);
-    free(s_quote_b64);
-    s_quote = NULL;
-    s_quote_b64 = NULL;
-    s_quote_len = 0;
     s_initialized = 0;
 }

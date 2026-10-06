@@ -242,8 +242,7 @@ static int handle_health(int fd)
     cJSON_AddNumberToObject(resp, "scans_completed", (double)atomic_load(&g_scans_completed));
     cJSON_AddNumberToObject(resp, "inflight", (double)atomic_load(&g_inflight));
     cJSON_AddNumberToObject(resp, "audit_write_failures", (double)audit_write_failures());
-    cJSON_AddStringToObject(resp, "attestation_mode",
-        attestation_get_mode() == ATTEST_MODE_EPID ? "epid" : "none");
+    cJSON_AddStringToObject(resp, "attestation_mode", "none");
     int rc = send_message(fd, resp);
     cJSON_Delete(resp);
     return rc;
@@ -273,44 +272,21 @@ static int handle_metrics(int fd)
     return rc;
 }
 
-static int handle_attestation(int fd, cJSON *msg)
+static int handle_attestation(int fd)
 {
-    attestation_maybe_refresh();
-
-    const unsigned char *noncep = NULL;
-    unsigned char nonce[TEE_ATTEST_NONCE_SIZE];
-    cJSON *nj = cJSON_GetObjectItemCaseSensitive(msg, "nonce");
-    if (cJSON_IsString(nj)) {
-        size_t nlen = 0;
-        if (sodium_base642bin(nonce, sizeof(nonce),
-                              nj->valuestring, strlen(nj->valuestring),
-                              NULL, &nlen, NULL,
-                              sodium_base64_VARIANT_ORIGINAL) != 0
-            || nlen != sizeof(nonce)) {
-            return send_error(fd, "invalid_nonce");
-        }
-        noncep = nonce;
-    }
-
     attestation_data_t data;
-    if (attestation_get_data(&data, noncep) != 0) {
+    if (attestation_get_data(&data) != 0) {
         return send_error(fd, "attestation_failed");
     }
 
     cJSON *resp = cJSON_CreateObject();
-    cJSON_AddStringToObject(resp, "attestation_mode",
-        attestation_get_mode() == ATTEST_MODE_EPID ? "epid" : "none");
+    cJSON_AddStringToObject(resp, "attestation_mode", "none");
     cJSON_AddStringToObject(resp, "enclave_public_key", data.enclave_pk_b64);
     cJSON_AddStringToObject(resp, "enclave_public_key_kyber",
         data.enclave_pk_kyber_b64 ? data.enclave_pk_kyber_b64 : "");
     cJSON_AddStringToObject(resp, "enclave_signing_pk_ed25519", data.enclave_pk_ed25519_b64);
     cJSON_AddStringToObject(resp, "enclave_signing_pk_mldsa",
         data.enclave_pk_mldsa_b64 ? data.enclave_pk_mldsa_b64 : "");
-    cJSON_AddStringToObject(resp, "sgx_quote", data.sgx_quote_b64 ? data.sgx_quote_b64 : "");
-    cJSON_AddStringToObject(resp, "ias_report", data.ias_report_b64 ? data.ias_report_b64 : "");
-    cJSON_AddStringToObject(resp, "ias_signature", data.ias_signature_b64 ? data.ias_signature_b64 : "");
-    cJSON_AddStringToObject(resp, "ias_cert_chain", data.ias_cert_chain ? data.ias_cert_chain : "");
-    cJSON_AddStringToObject(resp, "mrenclave", data.mrenclave_hex);
     cJSON_AddNumberToObject(resp, "enclave_epoch", (double)attestation_get_epoch());
 
     int rc = send_message(fd, resp);
@@ -459,14 +435,10 @@ static int scanner_sign_output_via_signer(tee_output_digest_t digest,
     return rc;
 }
 
-static int handle_attestation_proxy(int fd, cJSON *msg)
+static int handle_attestation_proxy(int fd)
 {
     cJSON *req = cJSON_CreateObject();
     cJSON_AddStringToObject(req, "op", OP_ATTESTATION);
-    cJSON *nj = cJSON_GetObjectItemCaseSensitive(msg, "nonce");
-    if (cJSON_IsString(nj)) {
-        cJSON_AddStringToObject(req, "nonce", nj->valuestring);
-    }
     cJSON *resp = signer_call(req);
     cJSON_Delete(req);
     if (!resp) {
@@ -1111,7 +1083,7 @@ static void handle_connection(int client_fd)
     if (strcmp(op_str, OP_SCAN) == 0) {
         handle_scan(client_fd, msg);
     } else if (strcmp(op_str, OP_ATTESTATION) == 0) {
-        handle_attestation_proxy(client_fd, msg);
+        handle_attestation_proxy(client_fd);
     } else if (strcmp(op_str, OP_HEALTH) == 0) {
         handle_health(client_fd);
     } else if (strcmp(op_str, OP_METRICS) == 0) {
@@ -1326,7 +1298,7 @@ static void handle_signer_connection(int client_fd)
     } else if (strcmp(op_str, OP_SIGN) == 0) {
         handle_signer_sign(client_fd, msg);
     } else if (strcmp(op_str, OP_ATTESTATION) == 0) {
-        handle_attestation(client_fd, msg);
+        handle_attestation(client_fd);
     } else if (strcmp(op_str, OP_HEALTH) == 0) {
         handle_health(client_fd);
     } else {
@@ -1477,8 +1449,6 @@ static int run_signer(const char *socket_path)
         fprintf(stderr, "FATAL: attestation_init() failed\n");
         return 1;
     }
-    fprintf(stderr, "INFO: signer attestation mode: %s\n",
-        attestation_get_mode() == ATTEST_MODE_EPID ? "epid" : "none");
 
     struct sigaction sa;
     memset(&sa, 0, sizeof(sa));

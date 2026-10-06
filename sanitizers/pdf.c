@@ -17,23 +17,15 @@ int sanitize_pdf(
     *out = NULL;
     *out_len = 0;
 
-    if (len > TEE_PDF_MAX_INPUT_BYTES) {
-        snprintf(reason, reason_size, "pdf_too_large");
-        return SANITIZE_REJECTED;
-    }
-
-    const char *gs = tee_find_binary(TEE_GS_CANDIDATES);
-    if (!gs) {
-        snprintf(reason, reason_size, "ghostscript_not_installed");
-        return SANITIZE_ERROR;
-    }
-
+    static const tee_converter_spec_t spec = {
+        TEE_PDF_MAX_INPUT_BYTES, "pdf_too_large",
+        TEE_GS_CANDIDATES, "ghostscript_not_installed", "tee_pdf_in", "tee_pdf_out",
+    };
+    const char *gs = NULL;
     tee_memfd_pair_t io;
-    const char *memfd_reason = NULL;
-    if (tee_memfd_pair_open(&io, "tee_pdf_in", "tee_pdf_out",
-                            data, len, &memfd_reason) != 0) {
-        snprintf(reason, reason_size, "%s", memfd_reason);
-        return SANITIZE_ERROR;
+    int open_rc = tee_converter_open(&spec, data, len, &gs, &io, reason, reason_size);
+    if (open_rc != TEE_CONVERTER_READY) {
+        return open_rc == TEE_CONVERTER_TOO_LARGE ? SANITIZE_REJECTED : SANITIZE_ERROR;
     }
     int in_fd = io.in_fd;
     int out_fd = io.out_fd;

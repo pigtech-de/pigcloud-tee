@@ -233,6 +233,39 @@ static inline int tee_memfd_pair_open(tee_memfd_pair_t *p,
     return 0;
 }
 
+typedef struct {
+    size_t max_input;
+    const char *too_large;
+    const char *const *candidates;
+    const char *not_installed;
+    const char *in_name;
+    const char *out_name;
+} tee_converter_spec_t;
+
+enum { TEE_CONVERTER_READY = 0, TEE_CONVERTER_TOO_LARGE = 1, TEE_CONVERTER_UNAVAILABLE = -1 };
+
+static inline int tee_converter_open(const tee_converter_spec_t *spec,
+                                     const unsigned char *data, size_t len,
+                                     const char **bin, tee_memfd_pair_t *io,
+                                     char *reason, size_t reason_size)
+{
+    if (len > spec->max_input) {
+        snprintf(reason, reason_size, "%s", spec->too_large);
+        return TEE_CONVERTER_TOO_LARGE;
+    }
+    *bin = tee_find_binary(spec->candidates);
+    if (!*bin) {
+        snprintf(reason, reason_size, "%s", spec->not_installed);
+        return TEE_CONVERTER_UNAVAILABLE;
+    }
+    const char *memfd_reason = NULL;
+    if (tee_memfd_pair_open(io, spec->in_name, spec->out_name, data, len, &memfd_reason) != 0) {
+        snprintf(reason, reason_size, "%s", memfd_reason);
+        return TEE_CONVERTER_UNAVAILABLE;
+    }
+    return TEE_CONVERTER_READY;
+}
+
 static inline int tee_spawn_converter(const char *bin, char *const argv[],
                                       int timeout_secs,
                                       const int *keep_fds, size_t n_keep)

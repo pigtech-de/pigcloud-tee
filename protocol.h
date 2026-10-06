@@ -27,8 +27,6 @@
 #define OP_UNSEAL        "unseal"
 #define OP_SIGN          "sign"
 
-#define TEE_ATTEST_NONCE_SIZE 32
-
 #define VERDICT_CLEAN     "clean"
 #define VERDICT_SANITIZED "sanitized"
 #define VERDICT_REJECTED  "rejected"

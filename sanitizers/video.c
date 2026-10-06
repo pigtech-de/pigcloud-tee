@@ -40,26 +40,18 @@ int sanitize_video(
     *out = NULL;
     *out_len = 0;
 
-    if (len > TEE_VIDEO_MAX_INPUT_BYTES) {
-        snprintf(reason, reason_size, "video_too_large");
-        return SANITIZE_REJECTED;
-    }
-
-    const char *ffmpeg = tee_find_binary(TEE_FFMPEG_CANDIDATES);
-    if (!ffmpeg) {
-        snprintf(reason, reason_size, "ffmpeg_not_installed");
-        return SANITIZE_ERROR;
+    static const tee_converter_spec_t spec = {
+        TEE_VIDEO_MAX_INPUT_BYTES, "video_too_large",
+        TEE_FFMPEG_CANDIDATES, "ffmpeg_not_installed", "tee_vid_in", "tee_vid_out",
+    };
+    const char *ffmpeg = NULL;
+    tee_memfd_pair_t io;
+    int open_rc = tee_converter_open(&spec, data, len, &ffmpeg, &io, reason, reason_size);
+    if (open_rc != TEE_CONVERTER_READY) {
+        return open_rc == TEE_CONVERTER_TOO_LARGE ? SANITIZE_REJECTED : SANITIZE_ERROR;
     }
 
     const char *fmt = ffmpeg_format(ext);
-
-    tee_memfd_pair_t io;
-    const char *memfd_reason = NULL;
-    if (tee_memfd_pair_open(&io, "tee_vid_in", "tee_vid_out",
-                            data, len, &memfd_reason) != 0) {
-        snprintf(reason, reason_size, "%s", memfd_reason);
-        return SANITIZE_ERROR;
-    }
     tee_attempt_chain_t chain;
     tee_chain_begin(&chain, ffmpeg, &io, TEE_SCAN_CONVERTER_BUDGET_SECS, TEE_SUBPROC_WALL_CAP_SECS);
 
