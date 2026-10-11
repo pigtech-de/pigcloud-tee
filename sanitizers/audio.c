@@ -22,7 +22,7 @@ static const char *ffmpeg_audio_format(const char *ext)
     if (strcasecmp(ext, "m4a") == 0) return "ipod";
     if (strcasecmp(ext, "m4r") == 0) return "ipod";
     if (strcasecmp(ext, "m4b") == 0) return "ipod";
-    if (strcasecmp(ext, "aac") == 0) return "ipod";
+    if (strcasecmp(ext, "aac") == 0) return "adts";
     if (strcasecmp(ext, "wav") == 0) return "wav";
     if (strcasecmp(ext, "weba") == 0) return "webm";
     if (strcasecmp(ext, "aiff") == 0 || strcasecmp(ext, "aif") == 0) return "aiff";
