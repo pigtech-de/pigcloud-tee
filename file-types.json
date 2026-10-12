@@ -347,7 +347,7 @@
     "sql":        { "type": "text", "mime": "application/sql", "cap": { "view": "native", "edit": "native" } },
     "gitignore":  { "type": "text", "cap": { "view": "native", "edit": "native" }, "icon": { "glyph": "fab:git", "color": "#F05032" } },
     "nomedia":    { "type": "text", "cap": { "view": "native", "edit": "native" } },
-    "plink":      { "type": "text", "mime": "text/plain" },
+    "plink":      { "type": "text", "mime": "text/plain", "cap": { "edit": "native" } },
     "gitattributes": { "type": "text", "cap": { "view": "native", "edit": "native" }, "icon": { "glyph": "fab:git", "color": "#F05032" } },
     "dockerignore": { "type": "text", "cap": { "view": "native", "edit": "native" }, "icon": { "glyph": "fab:docker", "color": "#2496ED" } },
     "npmignore":  { "type": "text", "cap": { "view": "native", "edit": "native" }, "icon": { "glyph": "fab:npm", "color": "#CB3837" } },
