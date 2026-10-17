@@ -34,6 +34,8 @@ EXTRA_MIME_ALIASES: dict[str, list[str]] = {
     "application/x-msdownload": ["application/x-dosexec", "application/vnd.microsoft.portable-executable"],
     "application/java-archive": ["application/x-java-archive"],
     "application/x-tar": ["application/x-gtar", "application/x-ustar"],
+    "text/csv": ["text/plain"],
+    "text/tab-separated-values": ["text/plain"],
     "font/ttf": ["application/x-font-ttf", "application/font-sfnt", "application/x-font-truetype"],
     "font/otf": ["application/x-font-otf", "application/font-sfnt", "application/vnd.ms-opentype"],
     "font/woff": ["application/font-woff"],
